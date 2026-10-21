@@ -1,0 +1,41 @@
+# Arquivos locais do macOS e Windows
+.DS_Store
+._*
+Thumbs.db
+Desktop.ini
+
+# Ferramentas locais e evidências geradas
+/.tools/
+/artifacts/
+
+# Builds .NET e resultados de testes
+**/bin/
+**/obj/
+**/TestResults/
+
+# Swift Package Manager e Xcode
+**/.build/
+**/DerivedData/
+**/xcuserdata/
+*.xcuserstate
+
+# Configurações pessoais de IDE
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Cache Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Variáveis locais e credenciais privadas
+.env
+.env.*
+!.env.example
+!.env.sample
+*.pfx
+*.p12
+*.key
