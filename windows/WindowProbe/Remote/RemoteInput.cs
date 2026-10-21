@@ -11,6 +11,14 @@ internal sealed class RemoteInput(IntPtr hwnd) : IDisposable
     private readonly object inputGate = new();
     private string? heldButton;
     private Timer? releaseTimer;
+
+    /// <summary>
+    /// Permite que o Mac mova o cursor do PC (hover). Desligado quando o
+    /// usuário está usando o PC ao mesmo tempo e não quer o cursor saltando.
+    /// </summary>
+    public bool AllowHover { get; set; } = true;
+
+    private bool allowHover => AllowHover;
     private static Process TargetProcess(IntPtr hwnd)
     {
         GetWindowThreadProcessId(hwnd, out uint pid);
@@ -56,7 +64,7 @@ internal sealed class RemoteInput(IntPtr hwnd) : IDisposable
     [DllImport("user32.dll")] private static extern bool IsIconic(IntPtr hwnd);
     [StructLayout(LayoutKind.Sequential)] private struct Point { public int X, Y; }
     [StructLayout(LayoutKind.Sequential)] private struct Rect { public int L, T, R, B; }
-    [StructLayout(LayoutKind.Sequential)] private struct Mouse { public int X, Y; public uint Data, Flags, Time; public UIntPtr Extra; }
+    [StructLayout(LayoutKind.Sequential)] private struct Mouse { public int X, Y; public uint Data, Flags, Time; public uint Data2; public UIntPtr Extra; }
     [StructLayout(LayoutKind.Sequential)] private struct Key { public ushort Vk, Scan; public uint Flags, Time; public UIntPtr Extra; }
     [StructLayout(LayoutKind.Explicit)] private struct Payload { [FieldOffset(0)] public Mouse Mouse; [FieldOffset(0)] public Key Key; }
     [StructLayout(LayoutKind.Sequential)] private struct Input { public uint Type; public Payload Value; }
@@ -67,14 +75,15 @@ internal sealed class RemoteInput(IntPtr hwnd) : IDisposable
     [DllImport("user32.dll")] private static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] private static extern bool IsWindow(IntPtr hwnd);
     [DllImport("user32.dll")] private static extern bool SetCursorPos(int x, int y);
+    [DllImport("user32.dll")] private static extern int GetSystemMetrics(int index);
     [DllImport("user32.dll")] private static extern IntPtr WindowFromPoint(Point point);
     [DllImport("user32.dll")] private static extern IntPtr GetAncestor(IntPtr hwnd, uint flags);
     [DllImport("dwmapi.dll")] private static extern int DwmGetWindowAttribute(IntPtr hwnd, int attr, out Rect rect, int size);
 
     private static Input Keyboard(ushort vk, bool up = false, ushort scan = 0, bool unicode = false) => new()
     { Type = 1, Value = new Payload { Key = new Key { Vk = vk, Scan = scan, Flags = (up ? 2u : 0u) | (unicode ? 4u : 0u) | (!unicode && vk is >= 0x21 and <= 0x2e ? 1u : 0u) } } };
-    private static Input MouseEvent(uint flags, int data = 0) => new()
-    { Type = 0, Value = new Payload { Mouse = new Mouse { Flags = flags, Data = unchecked((uint)data) } } };
+    private static Input MouseEvent(uint flags, int data = 0, int data2 = 0) => new()
+    { Type = 0, Value = new Payload { Mouse = new Mouse { Flags = flags, Data = unchecked((uint)data), Data2 = unchecked((uint)data2) } } };
 
     public string? TryApply(JsonElement command)
     {
@@ -86,6 +95,47 @@ internal sealed class RemoteInput(IntPtr hwnd) : IDisposable
             catch { ReleaseButton(); return "Falha interna ao aplicar a entrada."; }
         }
     }
+    /// <summary>
+    /// Move o cursor do PC para o ponto indicado sem enviar evento de botão.
+    /// Aceita janela visível e ponto não coberto; não exige foco.
+    /// </summary>
+    private void ApplyHover(JsonElement command)
+    {
+        // O usuário pode desligar o hover quando está usando o PC ao mesmo
+        // tempo: o cursor do Windows passaria a saltar para o Mac.
+        if (!allowHover) return;
+
+        double x = command.GetProperty("x").GetDouble(), y = command.GetProperty("y").GetDouble();
+        if (!double.IsFinite(x) || !double.IsFinite(y) || x < 0 || x >= 1 || y < 0 || y >= 1) return;
+        if (!IsWindow(hwnd) || !IsWindowVisible(hwnd) || IsIconic(hwnd)) return;
+
+        int boundsResult = DwmGetWindowAttribute(hwnd, 9, out var rect, Marshal.SizeOf<Rect>());
+        if (boundsResult < 0) return;
+        var point = new Point { X = rect.L + (int)(x * (rect.R - rect.L)), Y = rect.T + (int)(y * (rect.B - rect.T)) };
+        if (GetAncestor(WindowFromPoint(point), 2) != hwnd) return;
+        MoveCursor(point.X, point.Y);
+    }
+
+    /// <summary>
+    /// Move o cursor do PC. Usa SendInput absoluto (o mesmo caminho das outras
+    /// entradas) e cai para SetCursorPos quando a área virtual não pôde ser
+    /// obtida.
+    /// </summary>
+    private void MoveCursor(int x, int y)
+    {
+        if (GetSystemMetrics(76) is var virtualWidth && virtualWidth > 0
+            && GetSystemMetrics(77) is var virtualHeight && virtualHeight > 0
+            && GetSystemMetrics(78) is var virtualLeft && GetSystemMetrics(79) is var virtualTop)
+        {
+            int normalizedX = (int)Math.Round((x - virtualLeft) * 65535.0 / Math.Max(1, virtualWidth - 1));
+            int normalizedY = (int)Math.Round((y - virtualTop) * 65535.0 / Math.Max(1, virtualHeight - 1));
+            var move = MouseEvent(0x0001 | 0x8000, normalizedX, normalizedY);
+            if (SendInput(1, [move], Marshal.SizeOf<Input>()) == 1) return;
+        }
+
+        SetCursorPos(x, y);
+    }
+
     private void ApplyCore(JsonElement command)
     {
         string? type = command.GetProperty("type").GetString();
@@ -94,6 +144,13 @@ internal sealed class RemoteInput(IntPtr hwnd) : IDisposable
         {
             // Liberação não depende da janela ainda existir ou conservar o foco.
             ReleaseButton(); return;
+        }
+        if (type == "pointer" && action == "hover")
+        {
+            // Hover: move o ponteiro do PC sem clicar, sem exigir foco e sem
+            // liberar botão nenhum. Recusa é silenciosa (não é entrada crítica).
+            ApplyHover(command);
+            return;
         }
         if (type == "pointer" && action == "move")
         {
@@ -186,10 +243,26 @@ internal sealed class RemoteInput(IntPtr hwnd) : IDisposable
         var inputs = events.ToArray();
         if (SendInput((uint)inputs.Length, inputs, Marshal.SizeOf<Input>()) != inputs.Length)
         {
-            // Libera apenas teclas/botões deste lote caso UIPI ou troca de desktop interrompa a entrada.
-            var releases = inputs.Where(i => i.Type == 1 && (i.Value.Key.Flags & 2) != 0 || i.Type == 0 && (i.Value.Mouse.Flags & 20) != 0).ToArray();
+            // UIPI ou troca de desktop interrompeu o lote: libera o que ficou
+            // pressionado. O filtro precisa pegar os eventos de PRESSIONAMENTO
+            // (sem KEYUP / sem BUTTONUP) e reenviá-los como soltura, senão uma
+            // tecla modificadora fica presa no PC.
+            var releases = inputs
+                .Where(i => i.Type == 1 && (i.Value.Key.Flags & 2) == 0
+                         || i.Type == 0 && (i.Value.Mouse.Flags & 0x14) == 0)
+                .Select(i => i.Type == 1
+                    ? Keyboard(i.Value.Key.Vk, true)
+                    : MouseUpFor(i.Value.Mouse.Flags))
+                .ToArray();
             SendInput((uint)releases.Length, releases, Marshal.SizeOf<Input>());
             throw new InvalidOperationException("Windows recusou parte da entrada (possível UIPI).");
         }
+    }
+
+    /// <summary>Evento de soltura correspondente ao botão pressionado.</summary>
+    private static Input MouseUpFor(uint mouseFlags)
+    {
+        uint button = (mouseFlags & 0x02) != 0 ? 0x0004u : 0x0002u; // RIGHTUP : LEFTUP
+        return MouseEvent(button);
     }
 }

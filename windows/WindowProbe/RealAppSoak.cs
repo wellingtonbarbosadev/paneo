@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Net;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text.Json;
 using WindowProbe.Models;
 using WindowProbe.Remote;
@@ -39,9 +40,11 @@ internal static class RealAppSoak
             if (!ownsWindow) throw new InvalidOperationException("Bloco de Notas reutilizou janela existente. Abra uma instância separada para o teste.");
             RemoteInput.Activate(target);
             uint dpi = GetDpiForWindow(target);
-            server = new RemoteServer(target, IPAddress.Any, 0);
+            string pin = RandomNumberGenerator.GetInt32(10_000_000, 100_000_000).ToString(System.Globalization.CultureInfo.InvariantCulture);
+            var credentials = HostCredentials.Create(pin);
+            server = new RemoteServer(target, IPAddress.Any, 0, credentials, certificate: null);
             server.Start();
-            await File.WriteAllTextAsync(session, JsonSerializer.Serialize(new { host = "192.168.0.100", port = server.Port, fingerprint = server.Fingerprint, token = server.Token }));
+            await File.WriteAllTextAsync(session, JsonSerializer.Serialize(new { host = "192.168.0.100", port = server.Port, fingerprint = server.Fingerprint, pin }));
             var deadline = Stopwatch.StartNew();
             while (deadline.Elapsed < TimeSpan.FromMinutes(32) && !File.Exists(Path.Combine(directory, "client-done")))
             {

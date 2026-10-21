@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Runtime.InteropServices.WindowsRuntime;
 using System.Runtime.InteropServices;
 using Windows.Foundation;
 using Windows.Graphics;
@@ -20,6 +21,15 @@ public sealed record CapturedFrame(
     int Height,
     TimeSpan Elapsed,
     TimeSpan EncodeDuration);
+
+/// <summary>Quadro cru em BGRA (memória do sistema), usado pelo encoder H.264.</summary>
+public sealed record RawPixelFrame(
+    long Sequence,
+    byte[] Bgra,
+    int Width,
+    int Height,
+    int Stride,
+    TimeSpan Elapsed);
 
 /// <summary>Resumo de uma sessão contínua encerrada.</summary>
 public sealed record ContinuousCaptureSummary(
@@ -44,6 +54,15 @@ public sealed class ContinuousCaptureOptions
 
     /// <summary>Inclui o cursor no conteúdo capturado. Desligado por padrão.</summary>
     public bool CaptureCursor { get; init; }
+
+    /// <summary>
+    /// Entrega os pixels em BGRA em vez de PNG. Usado pelo pipeline de vídeo
+    /// H.264; evita codificar PNG apenas para decodificar de novo.
+    /// </summary>
+    public bool RawPixels { get; init; }
+
+    /// <summary>Recebe cada quadro cru quando <see cref="RawPixels"/> está ligado.</summary>
+    public Func<RawPixelFrame, CancellationToken, Task>? RawFrame { get; init; }
 }
 
 /// <summary>
@@ -176,7 +195,11 @@ public static class ContinuousWindowCapture
 
                     if (NativeMethods.IsIconic(hwnd))
                     {
-                        throw new CaptureException("A janela foi minimizada durante a captura contínua.");
+                        // Minimizar pausa o envio, mas não derruba a sessão: o
+                        // contrato exige que o vídeo volte ao restaurar.
+                        await Task.Delay(PollInterval, token).ConfigureAwait(false);
+                        lastFrameAt = watch.Elapsed;
+                        continue;
                     }
 
                     if (!NativeMethods.IsWindowVisible(hwnd))
@@ -220,6 +243,28 @@ public static class ContinuousWindowCapture
                     using SoftwareBitmap bitmap = await SoftwareBitmap
                         .CreateCopyFromSurfaceAsync(frame.Surface).AsTask(token).ConfigureAwait(false);
                     token.ThrowIfCancellationRequested();
+
+                    if (options.RawPixels && options.RawFrame is not null)
+                    {
+                        int stride = bitmap.PixelWidth * 4;
+                        var pixels = new byte[stride * bitmap.PixelHeight];
+                        // CopyToBuffer exige um IBuffer do tamanho do bitmap (BGRA empacotado).
+                        bitmap.CopyToBuffer(pixels.AsBuffer());
+                        var raw = new RawPixelFrame(
+                            sequence + 1,
+                            pixels,
+                            bitmap.PixelWidth,
+                            bitmap.PixelHeight,
+                            stride,
+                            watch.Elapsed);
+
+                        bitmap.Dispose();
+                        frame.Dispose();
+                        await options.RawFrame(raw, token).ConfigureAwait(false);
+                        sequence++;
+                        lastFrameAt = watch.Elapsed;
+                        continue;
+                    }
 
                     var encodeWatch = Stopwatch.StartNew();
                     byte[] png = await PngWriter.EncodeAsync(bitmap, token).ConfigureAwait(false);

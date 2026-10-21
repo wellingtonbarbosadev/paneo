@@ -1,5 +1,6 @@
 using System.IO;
 using System.Net;
+using System.Security.Cryptography;
 using System.Text.Json;
 using System.Windows;
 using System.Windows.Controls;
@@ -31,10 +32,12 @@ internal static class RemoteSmoke
         {
             window.Show(); window.Activate(); editor.Focus(); timer.Start();
             await Task.Delay(700);
-            server = new RemoteServer(new WindowInteropHelper(window).Handle, IPAddress.Any, 9443);
+            string pin = RandomNumberGenerator.GetInt32(10_000_000, 100_000_000).ToString(System.Globalization.CultureInfo.InvariantCulture);
+            var credentials = HostCredentials.Create(pin);
+            server = new RemoteServer(new WindowInteropHelper(window).Handle, IPAddress.Any, 9443, credentials, certificate: null);
             server.Start();
             await File.WriteAllTextAsync(sessionFile, JsonSerializer.Serialize(new
-            { host = "192.168.0.100", port = server.Port, fingerprint = server.Fingerprint, token = server.Token }));
+            { host = "192.168.0.100", port = server.Port, fingerprint = server.Fingerprint, pin }));
             var deadline = DateTime.UtcNow.AddMinutes(3);
             // Mac transmite texto fixo; o resultado é conferido na UI real do Windows.
             while (DateTime.UtcNow < deadline && !(server.FramesSent >= 10 && clicks > 0 && editor.Text == "Teste remoto: ação 123."))

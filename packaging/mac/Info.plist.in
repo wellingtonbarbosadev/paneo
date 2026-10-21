@@ -28,6 +28,10 @@
 	<true/>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
+	<!-- Necessario desde o macOS 15: sem esta descricao o sistema bloqueia o
+	     acesso a rede local e a conexao com o PC falha com "No route to host". -->
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Conecta ao seu PC Windows na rede local para mostrar e controlar as janelas remotas.</string>
 	<key>NSHumanReadableCopyright</key>
 	<string>Uso pessoal, sem garantia. Sem assinatura de desenvolvedor.</string>
 </dict>

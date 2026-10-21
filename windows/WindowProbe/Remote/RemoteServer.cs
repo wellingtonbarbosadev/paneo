@@ -1,166 +1,973 @@
+// O SDK do WPF não inclui System.IO nos implicit usings; Protocol.cs usa Stream
+// sem importar o namespace. Um global using daqui mantém aquele arquivo intacto.
+global using System.IO;
+
 using System.Buffers.Binary;
-using System.IO;
 using System.Net;
 using System.Net.Security;
 using System.Net.Sockets;
 using System.Security.Authentication;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
-using System.Text;
 using System.Text.Json;
 using WindowProbe.Capture;
 
 namespace WindowProbe.Remote;
 
+/// <summary>
+/// Host TLS do protocolo v2 (docs/PROTOCOL.md). Não depende de WPF, DPAPI nem
+/// DLLs nativas: a captura e a entrada chegam por WindowProbe.Capture e
+/// WindowProbe.Remote.RemoteInput (substituídos em tests/TransportTests).
+/// </summary>
 internal sealed class RemoteServer : IDisposable
 {
-    private readonly X509Certificate2 certificate;
-    private readonly CancellationTokenSource stop = new();
-    private readonly TcpListener listener;
+    private const string WindowSelectionUnavailable = "Seleção de janela pelo Mac ainda não está disponível.";
+    private const int HandshakeTimeoutSeconds = 10;
+    private const int IdleTimeoutSeconds = 10;
+
     private readonly IntPtr hwnd;
-    public string Token { get; } = Convert.ToHexString(RandomNumberGenerator.GetBytes(32));
-    public string Fingerprint => certificate.GetCertHashString(HashAlgorithmName.SHA256);
+    private readonly X509Certificate2 certificate;
+    private readonly bool ownsCertificate;
+    private readonly Func<IReadOnlyList<WindowDescriptor>>? windowList;
+    private readonly bool enableVideo;
+    private readonly TcpListener listener;
+    private readonly CancellationTokenSource stop = new();
+    private readonly AuthRateLimiter rateLimiter = new();
+    private readonly object credentialsGate = new();
+    private readonly object sessionsGate = new();
+    private readonly List<Task> sessions = [];
+    private HostCredentials credentials;
+    private int started;
+    private int stopped;
+    private int stopRequested;
+    private long framesSent;
+    private long inputsApplied;
+    private volatile bool allowHover = true;
+
+    /// <summary>SHA-256 do certificado DER, em hexadecimal maiúsculo.</summary>
+    public string Fingerprint { get; }
+
     public int Port => ((IPEndPoint)listener.LocalEndpoint).Port;
-    public Action<string>? Status { get; set; }
     public string? LastFailure { get; private set; }
-    public long FramesSent { get; private set; }
-    public long InputsApplied { get; private set; }
+    public long FramesSent => Interlocked.Read(ref framesSent);
+    public long InputsApplied => Interlocked.Read(ref inputsApplied);
+    public Action<string>? Status { get; set; }
+
+    /// <summary>Disparado quando o modo PIN cadastra um dispositivo (persistir sem bloquear).</summary>
+    public event EventHandler<HostCredentials>? CredentialsChanged;
+
     public Task Completion { get; private set; } = Task.CompletedTask;
 
-    public RemoteServer(IntPtr window, IPAddress address, int port, X509Certificate2? pairedCertificate = null, string? pairedToken = null)
+    public RemoteServer(
+        IntPtr window,
+        IPAddress address,
+        int port,
+        HostCredentials credentials,
+        X509Certificate2? certificate = null,
+        Func<IReadOnlyList<WindowDescriptor>>? windowList = null,
+        bool enableVideo = true)
     {
         hwnd = window;
-        if ((pairedCertificate is null) != (pairedToken is null)) throw new ArgumentException("Credenciais incompletas.");
-        if (pairedCertificate is not null)
+        this.credentials = credentials ?? throw new ArgumentNullException(nameof(credentials));
+        this.windowList = windowList;
+        this.enableVideo = enableVideo;
+        ArgumentNullException.ThrowIfNull(address);
+
+        if (certificate is null)
         {
-            certificate = pairedCertificate;
-            Token = pairedToken!;
-            listener = new TcpListener(address, port) { ExclusiveAddressUse = true };
-            return;
+            this.certificate = CreateEphemeralCertificate();
+            ownsCertificate = true;
         }
-        using var key = RSA.Create(2048);
-        var request = new CertificateRequest("CN=RemoteDesktop experimental", key, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
-        using var generated = request.CreateSelfSigned(DateTimeOffset.UtcNow.AddMinutes(-5), DateTimeOffset.UtcNow.AddHours(8));
-        // Schannel precisa de um container temporário de chave no perfil do usuário.
-        // Sem PersistKeySet: .NET remove o container ao descartar o certificado.
-        byte[] pfx = generated.Export(X509ContentType.Pfx);
-        try { certificate = X509CertificateLoader.LoadPkcs12(pfx, null, X509KeyStorageFlags.UserKeySet); }
-        finally { CryptographicOperations.ZeroMemory(pfx); }
+        else
+        {
+            this.certificate = certificate;
+        }
+
+        Fingerprint = this.certificate.GetCertHashString(HashAlgorithmName.SHA256);
         listener = new TcpListener(address, port) { ExclusiveAddressUse = true };
     }
 
-    public void Start() { listener.Start(1); Completion = RunAsync(); }
+    /// <summary>
+    /// Troca as credenciais em uso (rotação de PIN). Sem isso o servidor
+    /// continuaria aceitando o PIN antigo durante todo o compartilhamento.
+    /// </summary>
+    public void UpdateCredentials(HostCredentials updated)
+    {
+        ArgumentNullException.ThrowIfNull(updated);
+        lock (credentialsGate) credentials = updated;
+    }
+
+    /// <summary>Permite (ou bloqueia) que o Mac mova o cursor do PC.</summary>
+    public bool AllowHover
+    {
+        get => allowHover;
+        set => allowHover = value;
+    }
+
+    public void Start()
+    {
+        if (Interlocked.Exchange(ref started, 1) != 0) throw new InvalidOperationException("Servidor já iniciado.");
+        if (Volatile.Read(ref stopped) != 0) throw new ObjectDisposedException(nameof(RemoteServer));
+        listener.Start();
+        Completion = RunAsync();
+    }
+
     private async Task RunAsync()
     {
         try
         {
             while (!stop.IsCancellationRequested)
             {
-                using var client = await listener.AcceptTcpClientAsync(stop.Token);
+                TcpClient client;
+                try
+                {
+                    client = await listener.AcceptTcpClientAsync(stop.Token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) { break; }
+                catch (ObjectDisposedException) { break; }
+                catch (SocketException) when (stop.IsCancellationRequested) { break; }
+
                 client.NoDelay = true;
-                try { await HandleAsync(client, stop.Token); }
-                catch (Exception ex) when (!stop.IsCancellationRequested) { LastFailure ??= ex.GetType().Name + ":" + ex.HResult + "/" + ex.InnerException?.GetType().Name + ":" + ex.InnerException?.HResult; Status?.Invoke("Conexão encerrada ou recusada. Aguardando Mac."); }
+                Task session = HandleSafeAsync(client);
+                lock (sessionsGate) sessions.Add(session);
+                _ = session.ContinueWith(
+                    completed => { lock (sessionsGate) sessions.Remove(completed); },
+                    CancellationToken.None,
+                    TaskContinuationOptions.ExecuteSynchronously,
+                    TaskScheduler.Default);
             }
         }
         catch (OperationCanceledException) { }
-        catch (SocketException) when (stop.IsCancellationRequested) { }
+    }
+
+    private async Task HandleSafeAsync(TcpClient client)
+    {
+        using (client)
+        {
+            try
+            {
+                await HandleAsync(client, stop.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (stop.IsCancellationRequested) { }
+            catch (Exception ex)
+            {
+                LastFailure ??= ex.GetType().Name + ":" + ex.HResult + "/" +
+                    ex.InnerException?.GetType().Name + ":" + ex.InnerException?.HResult;
+                Status?.Invoke("Conexão encerrada ou recusada. Aguardando Mac.");
+            }
+        }
     }
 
     private async Task HandleAsync(TcpClient client, CancellationToken shutdown)
     {
         LastFailure = null;
         using var session = CancellationTokenSource.CreateLinkedTokenSource(shutdown);
+        // O handshake TLS também tem prazo: sem isso, um cliente que abre o TCP
+        // e não fala TLS segura a tarefa e o socket indefinidamente.
+        session.CancelAfter(TimeSpan.FromSeconds(HandshakeTimeoutSeconds + 10));
         using var tls = new SslStream(client.GetStream(), false);
-        using (var authDeadline = CancellationTokenSource.CreateLinkedTokenSource(session.Token))
+
+        await tls.AuthenticateAsServerAsync(new SslServerAuthenticationOptions
         {
-            authDeadline.CancelAfter(TimeSpan.FromSeconds(10));
-            await tls.AuthenticateAsServerAsync(new SslServerAuthenticationOptions
-            { ServerCertificate = certificate, EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13 }, authDeadline.Token);
-            using var auth = await ReadAsync(tls, authDeadline.Token);
-            var root = auth.RootElement;
-            if (root.GetProperty("type").GetString() != "auth" || root.GetProperty("version").GetInt32() != 1) return;
-            byte[] supplied = Encoding.UTF8.GetBytes(root.GetProperty("token").GetString() ?? "");
-            if (!CryptographicOperations.FixedTimeEquals(supplied, Encoding.UTF8.GetBytes(Token))) return;
-        }
-        using var writer = new SemaphoreSlim(1);
-        async Task Send(object message, CancellationToken ct)
-        {
-            byte[] payload = JsonSerializer.SerializeToUtf8Bytes(message);
-            if (payload.Length > 16 * 1024 * 1024) throw new IOException("Frame excede limite.");
-            byte[] header = new byte[4]; BinaryPrimitives.WriteInt32BigEndian(header, payload.Length);
-            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            deadline.CancelAfter(TimeSpan.FromSeconds(10));
-            await writer.WaitAsync(deadline.Token);
-            try { await tls.WriteAsync(header, deadline.Token); await tls.WriteAsync(payload, deadline.Token); }
-            finally { writer.Release(); }
-        }
-        await Send(new { type = "ready", version = 1 }, session.Token);
-        Status?.Invoke("Mac autenticado. Compartilhando janela autorizada.");
-        long pendingId = 0;
-        TaskCompletionSource? ack = null;
-        using var input = new RemoteInput(hwnd);
-        var gate = new object();
-        var receive = Task.Run(async () =>
-        {
-            try
-            {
-                while (true)
-                {
-                    using var deadline = CancellationTokenSource.CreateLinkedTokenSource(session.Token);
-                    deadline.CancelAfter(TimeSpan.FromSeconds(10));
-                    using var message = await ReadAsync(tls, deadline.Token);
-                    var root = message.RootElement;
-                    string? type = root.GetProperty("type").GetString();
-                    if (type == "ack")
-                    {
-                        lock (gate) { if (root.GetProperty("id").GetInt64() != pendingId || ack is null) throw new IOException("ACK inválido."); ack.TrySetResult(); }
-                    }
-                    else if (type == "ping") await Send(new { type = "pong" }, session.Token);
-                    else
-                    {
-                        // Executa sequencialmente. Nenhuma fila sobrevive à conexão.
-                        session.Token.ThrowIfCancellationRequested();
-                        string? rejection = input.TryApply(root);
-                        if (rejection is null) InputsApplied++;
-                        else
-                        {
-                            // Recusa pontual não encerra a sessão: informa e segue o streaming.
-                            LastFailure = rejection;
-                            Status?.Invoke("Entrada recusada: " + rejection);
-                            await Send(new { type = "inputRejected", message = rejection }, session.Token);
-                        }
-                    }
-                }
-            }
-            finally { session.Cancel(); }
-        }, session.Token);
+            ServerCertificate = certificate,
+            EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13
+        }, session.Token).ConfigureAwait(false);
+
+        HandshakeResult? handshake;
         try
         {
-            await ContinuousWindowCapture.RunAsync(hwnd, async (frame, ct) =>
+            handshake = await PerformHandshakeAsync(tls, client, session.Token).ConfigureAwait(false);
+        }
+        catch (ProtocolException)
+        {
+            await TrySendErrorAsync(tls, "Mensagem inválida.", session.Token).ConfigureAwait(false);
+            return;
+        }
+
+        if (handshake is null) return;
+
+        var ready = new Dictionary<string, object?>
+        {
+            ["type"] = "ready",
+            ["version"] = ProtocolV2.Version,
+            ["role"] = handshake.Role,
+            ["host"] = Environment.MachineName
+        };
+        if (handshake.DeviceToken is not null) ready["deviceToken"] = handshake.DeviceToken;
+
+        await SendControlAsync(tls, ready, session.Token).ConfigureAwait(false);
+
+        if (handshake.Role == "control")
+        {
+            Status?.Invoke("Mac autenticado. Lista de janelas disponível.");
+            await RunControlAsync(tls, session).ConfigureAwait(false);
+        }
+        else
+        {
+            Status?.Invoke("Mac autenticado. Compartilhando janela autorizada.");
+            await RunViewAsync(tls, session, handshake.WindowId).ConfigureAwait(false);
+        }
+    }
+
+    private sealed record HandshakeResult(string Role, string? DeviceToken, long? WindowId);
+
+    private async Task<HandshakeResult?> PerformHandshakeAsync(
+        SslStream tls, TcpClient client, CancellationToken sessionToken)
+    {
+        IncomingFrame? helloFrame = await ReadWithDeadlineAsync(
+            tls, sessionToken, TimeSpan.FromSeconds(HandshakeTimeoutSeconds)).ConfigureAwait(false);
+        if (helloFrame is null) return null;
+        if (!helloFrame.IsControl)
+        {
+            await TrySendErrorAsync(tls, "Mensagem inválida.", sessionToken).ConfigureAwait(false);
+            return null;
+        }
+
+        string role;
+        string clientName;
+        long? requestedWindow = null;
+        using (JsonDocument hello = helloFrame.ParseControl())
+        {
+            JsonElement root = hello.RootElement;
+            if (GetString(root, "type") != "hello")
             {
-                var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-                lock (gate) { pendingId = frame.Sequence; ack = completion; }
-                await Send(new { type = "frame", id = frame.Sequence, width = frame.Width, height = frame.Height, png = Convert.ToBase64String(frame.Png) }, ct);
-                await completion.Task.WaitAsync(TimeSpan.FromSeconds(10), ct);
-                FramesSent++;
-                await Task.Delay(125, ct);
-            }, new ContinuousCaptureOptions { FrameTimeout = TimeSpan.FromHours(8) }, null, session.Token);
+                await TrySendErrorAsync(tls, "Esperava hello.", sessionToken).ConfigureAwait(false);
+                return null;
+            }
+
+            if (!TryGetInt32(root, "version", out int version) || version != ProtocolV2.Version)
+            {
+                await TrySendErrorAsync(tls, "Versão de protocolo incompatível.", sessionToken).ConfigureAwait(false);
+                return null;
+            }
+
+            role = GetString(root, "role") ?? "";
+            if (role is not ("view" or "control"))
+            {
+                await TrySendErrorAsync(tls, "Papel de sessão inválido.", sessionToken).ConfigureAwait(false);
+                return null;
+            }
+
+            clientName = GetString(root, "clientName") ?? "Mac";
+            if (clientName.Length > 64)
+            {
+                await TrySendErrorAsync(tls, "Nome do cliente muito longo.", sessionToken).ConfigureAwait(false);
+                return null;
+            }
+
+            if (root.TryGetProperty("windowId", out JsonElement windowId) &&
+                windowId.ValueKind != JsonValueKind.Null)
+            {
+                if (windowId.ValueKind != JsonValueKind.Number || !windowId.TryGetInt64(out long value) || value <= 0)
+                {
+                    await TrySendErrorAsync(tls, "Mensagem inválida.", sessionToken).ConfigureAwait(false);
+                    return null;
+                }
+                requestedWindow = value;
+            }
+        }
+
+        IPAddress? remote = (client.Client.RemoteEndPoint as IPEndPoint)?.Address;
+        remote ??= IPAddress.None;
+
+        TimeSpan lockout = rateLimiter.RemainingLockout(remote);
+        if (lockout > TimeSpan.Zero)
+        {
+            await SendAuthFailedAsync(
+                tls, "Muitas tentativas. Aguarde e tente novamente.",
+                CeilSeconds(lockout), sessionToken).ConfigureAwait(false);
+            return null;
+        }
+
+        HostCredentials snapshot;
+        lock (credentialsGate) snapshot = credentials;
+        byte[] nonce = RandomNumberGenerator.GetBytes(32);
+
+        await SendControlAsync(tls, new
+        {
+            type = "challenge",
+            version = ProtocolV2.Version,
+            salt = Convert.ToBase64String(snapshot.Salt),
+            nonce = Convert.ToBase64String(nonce)
+        }, sessionToken).ConfigureAwait(false);
+
+        IncomingFrame? authFrame = await ReadWithDeadlineAsync(
+            tls, sessionToken, TimeSpan.FromSeconds(HandshakeTimeoutSeconds)).ConfigureAwait(false);
+        if (authFrame is null) return null;
+        if (!authFrame.IsControl)
+        {
+            await TrySendErrorAsync(tls, "Mensagem inválida.", sessionToken).ConfigureAwait(false);
+            return null;
+        }
+
+        string? mode;
+        byte[] proof;
+        using (JsonDocument auth = authFrame.ParseControl())
+        {
+            JsonElement root = auth.RootElement;
+            if (GetString(root, "type") != "auth")
+            {
+                await TrySendErrorAsync(tls, "Esperava auth.", sessionToken).ConfigureAwait(false);
+                return null;
+            }
+
+            if (!TryGetInt32(root, "version", out int version) || version != ProtocolV2.Version)
+            {
+                await TrySendErrorAsync(tls, "Versão de protocolo incompatível.", sessionToken).ConfigureAwait(false);
+                return null;
+            }
+
+            mode = GetString(root, "mode");
+            try { proof = Convert.FromBase64String(GetString(root, "proof") ?? ""); }
+            catch (FormatException) { proof = []; }
+        }
+
+        bool accepted;
+        lock (credentialsGate) accepted = credentials.TryVerify(mode ?? "", proof, nonce, out _);
+
+        if (!accepted)
+        {
+            TimeSpan wait = rateLimiter.RegisterFailure(remote);
+            await SendAuthFailedAsync(
+                tls, "PIN incorreto.", CeilSeconds(wait), sessionToken).ConfigureAwait(false);
+            return null;
+        }
+
+        rateLimiter.Reset(remote);
+
+        string? deviceToken = null;
+        if (string.Equals(mode, "pin", StringComparison.Ordinal))
+        {
+            HostCredentials updated;
+            PairedDevice created;
+            try
+            {
+                lock (credentialsGate)
+                {
+                    (updated, created) = credentials.AddDevice(clientName);
+                    credentials = updated;
+                }
+            }
+            catch (InvalidOperationException)
+            {
+                await TrySendErrorAsync(tls, "Limite de dispositivos pareados atingido.", sessionToken).ConfigureAwait(false);
+                return null;
+            }
+
+            deviceToken = Convert.ToBase64String(created.Token);
+            CredentialsChanged?.Invoke(this, updated);
+        }
+
+        // No modo device o token recebido não é reenviado em ready.
+        return new HandshakeResult(role, deviceToken, requestedWindow);
+    }
+
+    private async Task RunControlAsync(SslStream tls, CancellationTokenSource session)
+    {
+        await SendWindowsAsync(tls, session.Token).ConfigureAwait(false);
+
+        while (!session.IsCancellationRequested)
+        {
+            IncomingFrame? frame;
+            try
+            {
+                frame = await ReadWithDeadlineAsync(
+                    tls, session.Token, TimeSpan.FromSeconds(IdleTimeoutSeconds)).ConfigureAwait(false);
+            }
+            catch (ProtocolException)
+            {
+                await TrySendErrorAsync(tls, "Mensagem inválida.", session.Token).ConfigureAwait(false);
+                return;
+            }
+
+            if (frame is null) return;
+            if (!frame.IsControl)
+            {
+                await TrySendErrorAsync(tls, "Mensagem inválida.", session.Token).ConfigureAwait(false);
+                return;
+            }
+
+            using JsonDocument document = frame.ParseControl();
+            JsonElement root = document.RootElement;
+            switch (GetString(root, "type"))
+            {
+                case "list":
+                    await SendWindowsAsync(tls, session.Token).ConfigureAwait(false);
+                    break;
+                case "ping":
+                    await SendControlAsync(tls, new { type = "pong" }, session.Token).ConfigureAwait(false);
+                    break;
+                case "open":
+                    await TrySendErrorAsync(tls, WindowSelectionUnavailable, session.Token).ConfigureAwait(false);
+                    return;
+                case "click":
+                case "pointer":
+                case "scroll":
+                case "text":
+                case "key":
+                    // Sessão de controle não aplica entrada na Fase 1.
+                    break;
+                default:
+                    await TrySendErrorAsync(tls, "Mensagem desconhecida.", session.Token).ConfigureAwait(false);
+                    return;
+            }
+        }
+    }
+
+    /// <summary>Estado do pipeline de vídeo de uma sessão de visualização.</summary>
+    private sealed class VideoChannel
+    {
+        private readonly object gate = new();
+        private MfH264Encoder? encoder;
+        private int width;
+        private int height;
+
+        public string? Error { get; set; }
+        public bool Announced { get; set; }
+        public bool EncoderUnavailable { get; private set; }
+
+        /// <summary>Contador único de sequência da sessão (PNG e H.264).</summary>
+        private uint sequence;
+
+        /// <summary>Instante do último quadro aceito, para pacing de 30 FPS.</summary>
+        private long lastFrameTimestamp;
+
+        /// <summary>Erros de codificação consecutivos antes de desistir do H.264.</summary>
+        public int ConsecutiveEncodeFailures { get; set; }
+
+        /// <summary>Próximo número de sequência (monotônico na sessão).</summary>
+        public uint NextSequence() => Interlocked.Increment(ref sequence);
+
+        /// <summary>
+        /// Aplica o pacing de 30 FPS: o WGC entrega quadros na taxa do monitor,
+        /// mas o encoder está configurado para 30 FPS. Quadros acima da taxa são
+        /// descartados para não gastar CPU com um frame que seria descartado
+        /// pelo MFT de qualquer forma.
+        /// </summary>
+        public bool ShouldAcceptFrame(long timestampMilliseconds)
+        {
+            long minimumInterval = 1000L / VideoFps;
+            long previous = Interlocked.Read(ref lastFrameTimestamp);
+            if (previous != 0 && timestampMilliseconds - previous < minimumInterval) return false;
+            Interlocked.Exchange(ref lastFrameTimestamp, timestampMilliseconds);
+            return true;
+        }
+
+        /// <summary>Devolve o encoder do tamanho pedido, recriando quando a janela muda.</summary>
+        public MfH264Encoder? EnsureEncoder(int newWidth, int newHeight, out string? failure)
+        {
+            lock (gate)
+            {
+                failure = null;
+                if (encoder is not null && (width != newWidth || height != newHeight))
+                {
+                    encoder.Dispose();
+                    encoder = null;
+                    // O tamanho mudou: o cliente precisa da nova geometria.
+                    Announced = false;
+                }
+
+                if (encoder is not null) return encoder;
+
+                try
+                {
+                    encoder = new MfH264Encoder(newWidth, newHeight, VideoFps, VideoBitrate);
+                    encoder.RequestKeyframe();
+                    width = newWidth;
+                    height = newHeight;
+                    return encoder;
+                }
+                catch (Exception ex)
+                {
+                    EncoderUnavailable = true;
+                    failure = ex.Message;
+                    Error = ex.Message;
+                    return null;
+                }
+            }
+        }
+
+        public void RequestKeyframe()
+        {
+            lock (gate) { encoder?.RequestKeyframe(); }
+        }
+
+        public void Dispose()
+        {
+            lock (gate)
+            {
+                encoder?.Dispose();
+                encoder = null;
+            }
+        }
+    }
+
+    private const int VideoFps = 30;
+    private const int VideoBitrate = 8_000_000;
+
+    /// Resolve a janela que o Mac pediu. O identificador é o próprio handle da
+    /// janela, publicado na lista `windows`.
+    private IntPtr? ResolveWindow(long? requested)
+    {
+        if (requested is null)
+        {
+            return hwnd != IntPtr.Zero ? hwnd : null;
+        }
+
+        IReadOnlyList<WindowDescriptor> list;
+        try { list = windowList?.Invoke() ?? []; }
+        catch { return null; }
+
+        foreach (WindowDescriptor descriptor in list)
+        {
+            if (descriptor.Id != requested.Value) continue;
+            var handle = new IntPtr(descriptor.Id);
+            return handle != IntPtr.Zero ? handle : null;
+        }
+        return null;
+    }
+
+    private async Task RunViewAsync(SslStream tls, CancellationTokenSource session, long? requestedWindow)
+    {
+        IntPtr? target = ResolveWindow(requestedWindow);
+        if (target is null)
+        {
+            await TrySendErrorAsync(tls, "Janela não encontrada neste PC.", session.Token).ConfigureAwait(false);
+            return;
+        }
+
+        IntPtr windowHandle = target.Value;
+        using var input = new RemoteInput(windowHandle) { AllowHover = allowHover };
+        using var mediaInFlight = new SemaphoreSlim(2, 2);
+        var video = new VideoChannel();
+        video.RequestKeyframe();
+        Task receive = ReceiveViewAsync(tls, input, video, session);
+
+        try
+        {
+            // Primeiro tenta vídeo H.264; se o Windows não tiver encoder, cai para PNG.
+            for (int attempt = 0; attempt < 2; attempt++)
+            {
+                bool raw = enableVideo && attempt == 0;
+                try
+                {
+                    await RunCaptureAsync(tls, video, raw, mediaInFlight, windowHandle, session).ConfigureAwait(false);
+                    return;
+                }
+                catch (VideoEncoderUnavailable)
+                {
+                    Status?.Invoke("Sem encoder H.264 neste Windows; enviando PNG.");
+                    continue;
+                }
+            }
+        }
+        catch (OperationCanceledException) when (session.IsCancellationRequested) { }
+        catch (CaptureException ex)
+        {
+            LastFailure ??= ex.GetType().Name;
+            Status?.Invoke("Captura encerrada: " + ex.Message);
         }
         finally
         {
             session.Cancel();
-            try { await receive; } catch (Exception) { }
+            video.Dispose();
+            try { await receive.ConfigureAwait(false); } catch (Exception) { }
         }
     }
-    private static async Task<JsonDocument> ReadAsync(Stream stream, CancellationToken token)
+
+    private sealed class VideoEncoderUnavailable : Exception { }
+
+    private async Task RunCaptureAsync(
+        SslStream tls,
+        VideoChannel video,
+        bool raw,
+        SemaphoreSlim mediaInFlight,
+        IntPtr windowHandle,
+        CancellationTokenSource session)
     {
-        byte[] header = new byte[4]; await stream.ReadExactlyAsync(header, token);
-        int size = BinaryPrimitives.ReadInt32BigEndian(header);
-        // Comandos recebidos são pequenos; limite de imagens vale apenas na direção PC -> Mac.
-        if (size is <= 0 or > 8192) throw new IOException("Mensagem inválida.");
-        byte[] bytes = new byte[size]; await stream.ReadExactlyAsync(bytes, token);
-        return JsonDocument.Parse(bytes, new JsonDocumentOptions { MaxDepth = 8 });
+        var options = new ContinuousCaptureOptions
+        {
+            FrameTimeout = TimeSpan.FromHours(8),
+            RawPixels = raw,
+            // O cursor do PC precisa entrar no quadro: o Mac esconde o cursor
+            // local sobre a imagem, então sem isso não há ponteiro na tela.
+            CaptureCursor = true,
+            RawFrame = raw ? (Func<RawPixelFrame, CancellationToken, Task>)((rawFrame, ct) =>
+                SendVideoFrameAsync(tls, video, rawFrame, mediaInFlight, ct)) : null
+        };
+
+        await ContinuousWindowCapture.RunAsync(
+            windowHandle,
+            async (frame, ct) =>
+            {
+                if (frame.Width is <= 0 or > ushort.MaxValue || frame.Height is <= 0 or > ushort.MaxValue) return;
+
+                byte[] framed = FrameMedia(
+                    ProtocolV2.CodecPng,
+                    keyframe: true,
+                    video.NextSequence(),
+                    (uint)Math.Clamp(frame.Elapsed.TotalMilliseconds, 0d, uint.MaxValue),
+                    (ushort)frame.Width,
+                    (ushort)frame.Height,
+                    frame.Png);
+
+                await mediaInFlight.WaitAsync(ct).ConfigureAwait(false);
+                try
+                {
+                    await WriteAsync(tls, framed, ct).ConfigureAwait(false);
+                    Interlocked.Increment(ref framesSent);
+                }
+                finally { mediaInFlight.Release(); }
+
+                await Task.Delay(125, ct).ConfigureAwait(false);
+            },
+            options,
+            null,
+            session.Token).ConfigureAwait(false);
     }
-    public void Dispose() { stop.Cancel(); listener.Stop(); /* certificado liberado após o loop */ }
-    public async Task StopAsync() { Dispose(); await Completion; certificate.Dispose(); stop.Dispose(); }
+
+    private async Task SendVideoFrameAsync(
+        SslStream tls,
+        VideoChannel video,
+        RawPixelFrame rawFrame,
+        SemaphoreSlim mediaInFlight,
+        CancellationToken ct)
+    {
+        if (rawFrame.Width is <= 0 or > ushort.MaxValue || rawFrame.Height is <= 0 or > ushort.MaxValue) return;
+
+        long pts = (long)rawFrame.Elapsed.TotalMilliseconds;
+
+        // Pacing de 30 FPS: o WGC pode entregar mais quadros que o encoder usa.
+        if (!video.ShouldAcceptFrame(pts)) return;
+
+        MfH264Encoder? encoder = video.EnsureEncoder(rawFrame.Width, rawFrame.Height, out string? failure);
+        if (encoder is null)
+        {
+            throw new VideoEncoderUnavailable();
+        }
+
+        // O encoder pode codificar com dimensões alinhadas em 16 (padding); o
+        // cabeçalho de mídia deve refletir o que foi realmente codificado.
+        int encodedWidth = encoder.Width;
+        int encodedHeight = encoder.Height;
+
+        if (!video.Announced)
+        {
+            video.Announced = true;
+            await SendControlAsync(
+                tls,
+                new { type = "video", codec = "h264", width = encodedWidth, height = encodedHeight },
+                ct).ConfigureAwait(false);
+        }
+
+        List<EncodedAccessUnit> units;
+        try
+        {
+            units = encoder.Encode(rawFrame.Bgra, rawFrame.Stride, pts);
+            video.ConsecutiveEncodeFailures = 0;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // Falha de codificação não encerra a sessão: descarta o quadro,
+            // pede keyframe e conta. Depois de muitas falhas seguidas, o
+            // pipeline cai para PNG.
+            video.ConsecutiveEncodeFailures++;
+            video.Error = ex.Message;
+            video.RequestKeyframe();
+            if (video.ConsecutiveEncodeFailures >= 30) throw new VideoEncoderUnavailable();
+            return;
+        }
+
+        foreach (EncodedAccessUnit unit in units)
+        {
+            byte[] framed = FrameMedia(
+                ProtocolV2.CodecH264,
+                unit.Keyframe,
+                video.NextSequence(),
+                (uint)Math.Clamp(unit.PtsMs, 0d, uint.MaxValue),
+                (ushort)encodedWidth,
+                (ushort)encodedHeight,
+                unit.Data);
+
+            await mediaInFlight.WaitAsync(ct).ConfigureAwait(false);
+            try
+            {
+                await WriteAsync(tls, framed, ct).ConfigureAwait(false);
+                Interlocked.Increment(ref framesSent);
+            }
+            finally { mediaInFlight.Release(); }
+        }
+    }
+
+    private async Task ReceiveViewAsync(SslStream tls, RemoteInput input, VideoChannel video, CancellationTokenSource session)
+    {
+        try
+        {
+            while (!session.IsCancellationRequested)
+            {
+                IncomingFrame? frame;
+                try
+                {
+                    frame = await ReadWithDeadlineAsync(
+                        tls, session.Token, TimeSpan.FromSeconds(IdleTimeoutSeconds)).ConfigureAwait(false);
+                }
+                catch (ProtocolException)
+                {
+                    await TrySendErrorAsync(tls, "Mensagem inválida.", session.Token).ConfigureAwait(false);
+                    return;
+                }
+
+                if (frame is null) return;
+                if (!frame.IsControl)
+                {
+                    await TrySendErrorAsync(tls, "Mensagem inválida.", session.Token).ConfigureAwait(false);
+                    return;
+                }
+
+                using JsonDocument document = frame.ParseControl();
+                JsonElement root = document.RootElement;
+                switch (GetString(root, "type"))
+                {
+                    case "ping":
+                        await SendControlAsync(tls, new { type = "pong" }, session.Token).ConfigureAwait(false);
+                        break;
+                    case "requestKeyframe":
+                        video.RequestKeyframe();
+                        break;
+                    case "bye":
+                        // Encerramento limpio pedido pelo cliente.
+                        return;
+                    case "quality":
+                    case "list":
+                        // Mensagens opcionais: aceitas e ignoradas nesta versão.
+                        // Não podem derrubar a sessão de vídeo.
+                        break;
+                    case "open":
+                        await TrySendErrorAsync(tls, WindowSelectionUnavailable, session.Token).ConfigureAwait(false);
+                        return;
+                    case "click":
+                    case "pointer":
+                    case "scroll":
+                    case "text":
+                    case "key":
+                    {
+                        string? rejection = input.TryApply(root);
+                        if (rejection is null)
+                        {
+                            Interlocked.Increment(ref inputsApplied);
+                        }
+                        else
+                        {
+                            // Recusa pontual não encerra a sessão.
+                            LastFailure = rejection;
+                            Status?.Invoke("Entrada recusada: " + rejection);
+                            await SendControlAsync(
+                                tls, new { type = "inputRejected", message = rejection }, session.Token).ConfigureAwait(false);
+                        }
+                        break;
+                    }
+                    default:
+                        // Mensagem desconhecida não fecha a sessão: o host
+                        // continua servindo; apenas avisa.
+                        await TrySendErrorAsync(tls, "Mensagem desconhecida.", session.Token).ConfigureAwait(false);
+                        break;
+                }
+            }
+        }
+        catch (OperationCanceledException) when (session.IsCancellationRequested) { }
+        catch (IOException) { }
+        catch (ObjectDisposedException) { }
+        finally { session.Cancel(); }
+    }
+
+    private async Task SendWindowsAsync(SslStream tls, CancellationToken token)
+    {
+        IReadOnlyList<WindowDescriptor> windows;
+        try { windows = windowList?.Invoke() ?? []; }
+        catch { windows = []; }
+
+        await SendControlAsync(tls, new
+        {
+            type = "windows",
+            windows = windows.Select(window => new
+            {
+                id = window.Id,
+                title = window.Title,
+                process = window.Process,
+                width = window.Width,
+                height = window.Height
+            }).ToArray()
+        }, token).ConfigureAwait(false);
+    }
+
+    private Task SendAuthFailedAsync(SslStream tls, string message, int retryAfterSeconds, CancellationToken token) =>
+        SendControlAsync(tls, new
+        {
+            type = "authFailed",
+            version = ProtocolV2.Version,
+            message,
+            retryAfterSeconds
+        }, token);
+
+    private async Task SendControlAsync(SslStream tls, object message, CancellationToken token)
+    {
+        // O overload genérico de FrameControl<T> entra em recursão quando recebe
+        // byte[]; aqui o JSON é passado como ReadOnlySpan<byte> de propósito.
+        byte[] json = JsonSerializer.SerializeToUtf8Bytes(message);
+        byte[] framed = ProtocolV2.FrameControl(json.AsSpan());
+        if (framed.Length - 5 > ProtocolV2.MaxControlHostToClient)
+        {
+            throw new ProtocolException("Controle acima do limite.");
+        }
+
+        await WriteAsync(tls, framed, token).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Gate de escrita por conexão. Um gate global congelaria o vídeo de todas
+    /// as sessões quando um cliente lento parasse de ler.
+    /// </summary>
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<SslStream, SemaphoreSlim> writeGates = new();
+
+    private async Task WriteAsync(SslStream tls, ReadOnlyMemory<byte> bytes, CancellationToken token)
+    {
+        SemaphoreSlim gate = writeGates.GetOrAdd(tls, _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(token).ConfigureAwait(false);
+        try
+        {
+            await tls.WriteAsync(bytes, token).ConfigureAwait(false);
+            await tls.FlushAsync(token).ConfigureAwait(false);
+        }
+        finally { gate.Release(); }
+    }
+
+    private async Task TrySendErrorAsync(SslStream tls, string message, CancellationToken token)
+    {
+        try
+        {
+            await SendControlAsync(tls, new { type = "error", message }, token).ConfigureAwait(false);
+        }
+        catch (Exception) { /* conexão já caiu */ }
+    }
+
+    private static async Task<IncomingFrame?> ReadWithDeadlineAsync(
+        Stream stream, CancellationToken outer, TimeSpan timeout)
+    {
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(outer);
+        deadline.CancelAfter(timeout);
+        try
+        {
+            return await FrameReader.ReadAsync(stream, ProtocolV2.MaxControlClientToHost, deadline.Token)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (!outer.IsCancellationRequested)
+        {
+            // Timeout de handshake ou de heartbeat.
+            return null;
+        }
+    }
+
+    private static string? GetString(JsonElement root, string name) =>
+        root.TryGetProperty(name, out JsonElement value) && value.ValueKind == JsonValueKind.String
+            ? value.GetString()
+            : null;
+
+    private static bool TryGetInt32(JsonElement root, string name, out int result)
+    {
+        result = 0;
+        return root.TryGetProperty(name, out JsonElement value) &&
+            value.ValueKind == JsonValueKind.Number &&
+            value.TryGetInt32(out result);
+    }
+
+    private static int CeilSeconds(TimeSpan value) =>
+        value <= TimeSpan.Zero ? 0 : (int)Math.Ceiling(value.TotalSeconds);
+
+    /// <summary>
+    /// Enquadramento de mídia conforme docs/PROTOCOL.md: kind + codec + flags +
+    /// seq + ptsMs + largura + altura + bytes do quadro. Feito localmente porque
+    /// ProtocolV2.FrameMedia/FrameReader divergem do contrato no layout de mídia.
+    /// </summary>
+    private static byte[] FrameMedia(
+        byte codec,
+        bool keyframe,
+        uint sequence,
+        uint ptsMs,
+        ushort width,
+        ushort height,
+        ReadOnlySpan<byte> payload)
+    {
+        const int headerBytes = 1 + 1 + 2 + 4 + 4 + 2 + 2; // kind + 15 bytes de cabeçalho
+        if (payload.Length == 0 || payload.Length + headerBytes > ProtocolV2.MaxMessageBytes)
+        {
+            throw new ProtocolException("Quadro de mídia inválido.");
+        }
+
+        byte[] framed = new byte[4 + headerBytes + payload.Length];
+        BinaryPrimitives.WriteInt32BigEndian(framed, headerBytes + payload.Length);
+        int at = 4;
+        framed[at++] = ProtocolV2.KindMedia;
+        framed[at++] = codec;
+        BinaryPrimitives.WriteUInt16BigEndian(framed.AsSpan(at), keyframe ? ProtocolV2.FlagKeyframe : (ushort)0);
+        at += 2;
+        BinaryPrimitives.WriteUInt32BigEndian(framed.AsSpan(at), sequence);
+        at += 4;
+        BinaryPrimitives.WriteUInt32BigEndian(framed.AsSpan(at), ptsMs);
+        at += 4;
+        BinaryPrimitives.WriteUInt16BigEndian(framed.AsSpan(at), width);
+        at += 2;
+        BinaryPrimitives.WriteUInt16BigEndian(framed.AsSpan(at), height);
+        at += 2;
+        payload.CopyTo(framed.AsSpan(at));
+        return framed;
+    }
+
+    private static X509Certificate2 CreateEphemeralCertificate()
+    {
+        using var key = RSA.Create(2048);
+        var request = new CertificateRequest(
+            "CN=RemoteDesktop experimental", key, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+        using var generated = request.CreateSelfSigned(
+            DateTimeOffset.UtcNow.AddMinutes(-5), DateTimeOffset.UtcNow.AddHours(8));
+
+        // Schannel precisa de um container temporário de chave no perfil do usuário.
+        // Sem PersistKeySet: .NET remove o container ao descartar o certificado.
+        byte[] pfx = generated.Export(X509ContentType.Pfx);
+        try
+        {
+            return X509CertificateLoader.LoadPkcs12(pfx, null, X509KeyStorageFlags.UserKeySet);
+        }
+        finally { CryptographicOperations.ZeroMemory(pfx); }
+    }
+
+    public void Dispose()
+    {
+        if (Interlocked.Exchange(ref stopped, 1) != 0) return;
+        try { stop.Cancel(); } catch (ObjectDisposedException) { }
+        try { listener.Stop(); } catch (SocketException) { }
+    }
+
+    public async Task StopAsync()
+    {
+        if (Interlocked.Exchange(ref stopRequested, 1) != 0)
+        {
+            try { await Completion.ConfigureAwait(false); } catch { }
+            return;
+        }
+
+        Dispose();
+        try { await Completion.ConfigureAwait(false); } catch { }
+
+        Task[] pending;
+        lock (sessionsGate) pending = [.. sessions];
+        if (pending.Length > 0)
+        {
+            try { await Task.WhenAll(pending).ConfigureAwait(false); } catch { }
+        }
+
+        if (ownsCertificate) certificate.Dispose();
+        foreach (SemaphoreSlim gate in writeGates.Values) gate.Dispose();
+        writeGates.Clear();
+        stop.Dispose();
+    }
 }

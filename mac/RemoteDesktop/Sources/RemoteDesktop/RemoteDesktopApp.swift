@@ -34,6 +34,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             catch { exit(2) }
             return
         }
+        if args.count == 4, args[1] == "--video-smoke" {
+            exit(VideoSmoke.run(inputPath: args[2], outputPath: args[3]))
+        }
         if args.count == 4, args[1] == "--remote-smoke" {
             do { smoke = try RemoteSmoke(sessionPath: args[2], outputPath: args[3]) }
             catch { exit(2) }
