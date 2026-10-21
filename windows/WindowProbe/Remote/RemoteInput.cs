@@ -31,6 +31,26 @@ internal sealed class RemoteInput(IntPtr hwnd) : IDisposable
         releaseTimer?.Change(Timeout.Infinite, Timeout.Infinite);
     }
     internal static void Activate(IntPtr window) => SetForegroundWindow(window);
+    // Melhor esforço: alterna para a janela sem lançar exceção se o Windows negar o foco.
+    private static void BringToForeground(IntPtr hwnd)
+    {
+        SetForegroundWindow(hwnd);
+        WaitForForeground(hwnd, 250);
+        if (GetForegroundWindow() == hwnd) return;
+        IntPtr current = GetForegroundWindow();
+        uint currentThread = current == IntPtr.Zero ? 0 : GetWindowThreadProcessId(current, out _);
+        uint targetThread = GetWindowThreadProcessId(hwnd, out _);
+        bool attached = currentThread != 0 && targetThread != 0 && currentThread != targetThread
+            && AttachThreadInput(currentThread, targetThread, true);
+        try { BringWindowToTop(hwnd); SetForegroundWindow(hwnd); }
+        finally { if (attached) AttachThreadInput(currentThread, targetThread, false); }
+        WaitForForeground(hwnd, 250);
+    }
+    private static void WaitForForeground(IntPtr hwnd, int milliseconds)
+    {
+        // Ativação entre threads é assíncrona: dê tempo à UI para processar o foco.
+        for (int elapsed = 0; elapsed < milliseconds && GetForegroundWindow() != hwnd; elapsed += 10) Thread.Sleep(10);
+    }
     [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
     [DllImport("user32.dll")] private static extern bool IsWindowVisible(IntPtr hwnd);
     [DllImport("user32.dll")] private static extern bool IsIconic(IntPtr hwnd);
@@ -42,6 +62,8 @@ internal sealed class RemoteInput(IntPtr hwnd) : IDisposable
     [StructLayout(LayoutKind.Sequential)] private struct Input { public uint Type; public Payload Value; }
     [DllImport("user32.dll")] private static extern uint SendInput(uint count, Input[] inputs, int size);
     [DllImport("user32.dll")] private static extern bool SetForegroundWindow(IntPtr hwnd);
+    [DllImport("user32.dll")] private static extern bool BringWindowToTop(IntPtr hwnd);
+    [DllImport("user32.dll")] private static extern bool AttachThreadInput(uint attach, uint attachTo, bool attachFlag);
     [DllImport("user32.dll")] private static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] private static extern bool IsWindow(IntPtr hwnd);
     [DllImport("user32.dll")] private static extern bool SetCursorPos(int x, int y);
@@ -54,12 +76,14 @@ internal sealed class RemoteInput(IntPtr hwnd) : IDisposable
     private static Input MouseEvent(uint flags, int data = 0) => new()
     { Type = 0, Value = new Payload { Mouse = new Mouse { Flags = flags, Data = unchecked((uint)data) } } };
 
-    public void Apply(JsonElement command)
+    public string? TryApply(JsonElement command)
     {
         lock (inputGate)
         {
-            try { ApplyCore(command); }
-            catch { ReleaseButton(); throw; }
+            try { ApplyCore(command); return null; }
+            catch (InvalidOperationException ex) { ReleaseButton(); return ex.Message; }
+            // Falha inesperada também não derruba a sessão: libera o botão e informa o Mac.
+            catch { ReleaseButton(); return "Falha interna ao aplicar a entrada."; }
         }
     }
     private void ApplyCore(JsonElement command)
@@ -71,12 +95,17 @@ internal sealed class RemoteInput(IntPtr hwnd) : IDisposable
             // Liberação não depende da janela ainda existir ou conservar o foco.
             ReleaseButton(); return;
         }
+        if (type == "pointer" && action == "move")
+        {
+            // Movimento só interessa como arraste de um botão já mantido por esta sessão.
+            string? movedButton = command.TryGetProperty("button", out var pressed) && pressed.ValueKind == JsonValueKind.String
+                ? pressed.GetString() : null;
+            if (heldButton is null || movedButton != heldButton) return;
+        }
         GetWindowThreadProcessId(hwnd, out uint currentPid);
         if (process.HasExited || currentPid != process.Id || !IsWindow(hwnd) || !IsWindowVisible(hwnd) || IsIconic(hwnd))
             throw new InvalidOperationException("Janela encerrada, oculta ou minimizada.");
-        SetForegroundWindow(hwnd);
-        // Ativação entre threads é assíncrona: dê tempo à UI para processar o foco.
-        for (int attempt = 0; attempt < 25 && GetForegroundWindow() != hwnd; attempt++) Thread.Sleep(10);
+        BringToForeground(hwnd);
         bool activates = type == "click" || type == "pointer" && action == "down";
         if (!activates && GetForegroundWindow() != hwnd)
             throw new InvalidOperationException("Windows recusou o foco da janela autorizada. Clique primeiro na janela visível.");
@@ -86,7 +115,8 @@ internal sealed class RemoteInput(IntPtr hwnd) : IDisposable
             double x = command.GetProperty("x").GetDouble(), y = command.GetProperty("y").GetDouble();
             if (!double.IsFinite(x) || !double.IsFinite(y) || x < 0 || x >= 1 || y < 0 || y >= 1)
                 throw new InvalidOperationException("Coordenadas inválidas.");
-            Marshal.ThrowExceptionForHR(DwmGetWindowAttribute(hwnd, 9, out var rect, Marshal.SizeOf<Rect>()));
+            int boundsResult = DwmGetWindowAttribute(hwnd, 9, out var rect, Marshal.SizeOf<Rect>());
+            if (boundsResult < 0) throw new InvalidOperationException("Não foi possível obter os limites da janela.");
             var point = new Point { X = rect.L + (int)(x * (rect.R - rect.L)), Y = rect.T + (int)(y * (rect.B - rect.T)) };
             if (GetAncestor(WindowFromPoint(point), 2) != hwnd)
                 throw new InvalidOperationException("Ponto coberto por outra janela; entrada recusada.");
@@ -95,8 +125,10 @@ internal sealed class RemoteInput(IntPtr hwnd) : IDisposable
             {
                 string? button = command.GetProperty("button").GetString();
                 if (button is not ("left" or "right")) throw new InvalidOperationException("Botão inválido.");
-                if (action == "down" && heldButton is null)
+                if (action == "down")
                 {
+                    // Botão já mantido (por exemplo, clique duplicado): ignora sem enviar entrada.
+                    if (heldButton is not null) return;
                     heldButton = button;
                     events.Add(MouseEvent(button == "left" ? 2u : 8u));
                     releaseTimer ??= new Timer(_ => {

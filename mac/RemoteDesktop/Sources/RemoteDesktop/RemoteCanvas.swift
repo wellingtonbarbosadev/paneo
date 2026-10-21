@@ -13,6 +13,8 @@ final class RemoteCanvas: NSView, @preconcurrency NSTextInputClient {
     private var selection = NSRange(location: 0, length: 0)
     override var acceptsFirstResponder: Bool { true }
     override var isFlipped: Bool { true }
+    // O clique que ativa a janela também deve ser entregue ao host: o padrão do AppKit descarta o primeiro clique.
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     override func resignFirstResponder() -> Bool { resetInput(); return super.resignFirstResponder() }
     func present(_ data: Data, width: Int, height: Int) -> Bool {
         guard let source = CGImageSourceCreateWithData(data as CFData, nil),

@@ -19,11 +19,13 @@ final class RemoteConnection: @unchecked Sendable {
     private let onRoundTrip: @MainActor @Sendable (Double) -> Void
     private let onState: @MainActor @Sendable (String, Bool) -> Void
     private let onFrame: @MainActor @Sendable (Data, Int, Int, Int) -> Void
+    private let onNotice: @MainActor @Sendable (String) -> Void
 
     init(onState: @escaping @MainActor @Sendable (String, Bool) -> Void,
           onFrame: @escaping @MainActor @Sendable (Data, Int, Int, Int) -> Void,
-          onRoundTrip: @escaping @MainActor @Sendable (Double) -> Void = { _ in }) {
-        self.onState = onState; self.onFrame = onFrame; self.onRoundTrip = onRoundTrip
+          onRoundTrip: @escaping @MainActor @Sendable (Double) -> Void = { _ in },
+          onNotice: @escaping @MainActor @Sendable (String) -> Void = { _ in }) {
+        self.onState = onState; self.onFrame = onFrame; self.onRoundTrip = onRoundTrip; self.onNotice = onNotice
     }
     func connect(host: String, port: UInt16, fingerprint: String, token: String) {
         queue.async { [self] in
@@ -139,6 +141,14 @@ final class RemoteConnection: @unchecked Sendable {
                   let encoded = message.png, let png = Data(base64Encoded: encoded) else { throw FramingError.malformed }
             pendingFrame = id; lastFrame = id
             Task { @MainActor [onFrame] in onFrame(png, width, height, id) }
+        case "inputRejected":
+            // O host recusou a entrada (ex.: janela perdeu o foco) e continua conectado; apenas informa o motivo.
+            let reason = message.message?.isEmpty == false ? message.message! : "o Windows recusou a entrada"
+            Task { @MainActor [onNotice] in onNotice("Windows recusou a entrada: " + reason) }
+        case "error":
+            // Aviso do host sem encerramento da sessão.
+            let reason = message.message?.isEmpty == false ? message.message! : "erro do host"
+            Task { @MainActor [onNotice] in onNotice("Host Windows informou: " + reason) }
         default: throw FramingError.malformed
         }
     }

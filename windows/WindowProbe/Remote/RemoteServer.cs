@@ -120,8 +120,15 @@ internal sealed class RemoteServer : IDisposable
                     {
                         // Executa sequencialmente. Nenhuma fila sobrevive à conexão.
                         session.Token.ThrowIfCancellationRequested();
-                        try { input.Apply(root); InputsApplied++; }
-                        catch (InvalidOperationException ex) { LastFailure = ex.Message; throw; }
+                        string? rejection = input.TryApply(root);
+                        if (rejection is null) InputsApplied++;
+                        else
+                        {
+                            // Recusa pontual não encerra a sessão: informa e segue o streaming.
+                            LastFailure = rejection;
+                            Status?.Invoke("Entrada recusada: " + rejection);
+                            await Send(new { type = "inputRejected", message = rejection }, session.Token);
+                        }
                     }
                 }
             }

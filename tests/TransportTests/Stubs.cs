@@ -4,7 +4,8 @@ namespace WindowProbe.Remote
     internal sealed class RemoteInput(IntPtr hwnd) : IDisposable
     {
         public void Dispose() { }
-        public void Apply(System.Text.Json.JsonElement message) { _ = hwnd; throw new InvalidOperationException("Entrada não habilitada no teste de protocolo."); }
+        public string? TryApply(System.Text.Json.JsonElement message)
+        { _ = hwnd; _ = message; return "Entrada não habilitada no teste de protocolo."; }
     }
 }
 namespace WindowProbe.Capture

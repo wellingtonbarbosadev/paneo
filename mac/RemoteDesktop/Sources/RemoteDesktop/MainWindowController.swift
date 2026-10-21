@@ -99,6 +99,9 @@ final class MainWindowController: NSObject, NSWindowDelegate {
         }, onRoundTrip: { [weak self] milliseconds in
             guard let self, self.generation == current else { return }
             self.roundTrip = milliseconds
+        }, onNotice: { [weak self] message in
+            guard let self, self.generation == current else { return }
+            self.status.stringValue = message
         })
         connection = client; button.title = "Desconectar"; status.stringValue = "Conectando…"
         let host = address.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).trimmingCharacters(in: CharacterSet(charactersIn: "[]"))

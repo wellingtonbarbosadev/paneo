@@ -63,6 +63,37 @@ try
         Check(await tls.ReadAsync(new byte[1], ct) == 0, "ACK inválido aceito.");
         Console.WriteLine("PASS framing fragmentado, ACK, backpressure, heartbeat e ACK inválido");
     }
+    var (inputTcp, inputTls) = await Connect();
+    using (inputTcp) using (inputTls)
+    {
+        await Send(inputTls, new { type = "auth", version = 1, token = server.Token });
+        Check((await Read(inputTls)).GetProperty("type").GetString() == "ready", "Ready ausente.");
+        var liveFrame = await Read(inputTls);
+        Check(liveFrame.GetProperty("type").GetString() == "frame", "Frame ausente.");
+        await Send(inputTls, new { type = "pointer", action = "down", x = 0.5, y = 0.5, button = "left" });
+        JsonElement rejection = default;
+        bool rejected = false;
+        for (int i = 0; i < 6 && !rejected; i++)
+        {
+            var message = await Read(inputTls);
+            if (message.GetProperty("type").GetString() == "inputRejected") { rejection = message; rejected = true; }
+        }
+        Check(rejected, "Recusa de entrada não foi notificada.");
+        Check(rejection.GetProperty("message").GetString() == "Entrada não habilitada no teste de protocolo.", "Motivo da recusa inesperado.");
+        await Send(inputTls, new { type = "ack", id = liveFrame.GetProperty("id").GetInt64() });
+        await Send(inputTls, new { type = "ping" });
+        bool pong = false, nextFrame = false;
+        for (int i = 0; i < 6 && !(pong && nextFrame); i++)
+        {
+            var message = await Read(inputTls);
+            string? kind = message.GetProperty("type").GetString();
+            if (kind == "pong") pong = true;
+            else if (kind == "frame") nextFrame = true;
+        }
+        Check(pong, "Pong ausente após a recusa de entrada.");
+        Check(nextFrame, "Streaming interrompido após a recusa de entrada.");
+        Console.WriteLine("PASS recusa de entrada não encerra a sessão TLS nem o streaming");
+    }
     var (largeTcp, largeTls) = await Connect();
     using (largeTcp) using (largeTls)
     {
