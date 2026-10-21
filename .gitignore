@@ -8,6 +8,12 @@ Desktop.ini
 /.tools/
 /artifacts/
 
+# Documentação local (manter apenas README.md) e scripts auxiliares
+*.md
+!README.md
+/scripts/
+/experiments/
+
 # Builds .NET e resultados de testes
 **/bin/
 **/obj/

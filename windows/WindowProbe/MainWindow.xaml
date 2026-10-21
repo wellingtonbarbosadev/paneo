@@ -1,0 +1,76 @@
+<Window x:Class="WindowProbe.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="WindowProbe — protótipo de captura de janelas"
+        Width="1000" Height="660" MinWidth="820" MinHeight="540"
+        WindowStartupLocation="CenterScreen"
+        UseLayoutRounding="True"
+        SnapsToDevicePixels="True">
+    <Grid Margin="14">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="160" />
+        </Grid.RowDefinitions>
+
+        <StackPanel Grid.Row="0" Margin="0,0,0,10">
+            <TextBlock Text="WindowProbe" FontSize="20" FontWeight="SemiBold" />
+            <TextBlock Margin="0,2,0,0" Foreground="#555555" TextWrapping="Wrap"
+                       Text="Captura local de janelas com Windows.Graphics.Capture. Nenhum dado sai desta máquina; não há rede, serviço, persistência automática nem injeção de entrada." />
+        </StackPanel>
+
+        <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,0,0,8">
+            <Button x:Name="RefreshButton" Content="Atualizar lista" Padding="12,6"
+                    Margin="0,0,8,0" Click="RefreshButton_Click" />
+            <Button x:Name="CaptureButton" Content="Capturar selecionada…" Padding="12,6"
+                    Margin="0,0,8,0" Click="CaptureButton_Click" />
+            <Button x:Name="DestinationButton" Content="Escolher destino…" Padding="12,6"
+                    Click="DestinationButton_Click" />
+        </StackPanel>
+
+        <Border Grid.Row="2" BorderBrush="#DDDDDD" BorderThickness="1" Margin="0,0,0,8">
+            <ListView x:Name="WindowList" SelectionMode="Single"
+                      ScrollViewer.HorizontalScrollBarVisibility="Auto">
+                <ListView.View>
+                    <GridView>
+                        <GridViewColumn Header="Processo" Width="150"
+                                        DisplayMemberBinding="{Binding ProcessName}" />
+                        <GridViewColumn Header="Título" Width="520"
+                                        DisplayMemberBinding="{Binding Title}" />
+                        <GridViewColumn Header="Handle" Width="110"
+                                        DisplayMemberBinding="{Binding HandleText}" />
+                        <GridViewColumn Header="Tamanho" Width="110"
+                                        DisplayMemberBinding="{Binding DimensionsText}" />
+                    </GridView>
+                </ListView.View>
+            </ListView>
+        </Border>
+
+        <Grid Grid.Row="3" Margin="0,0,0,6">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="*" />
+            </Grid.ColumnDefinitions>
+            <TextBlock Grid.Column="0" Text="Destino do PNG:" VerticalAlignment="Center"
+                       Margin="0,0,8,0" />
+            <TextBox Grid.Column="1" x:Name="DestinationPathBox" IsReadOnly="True"
+                     VerticalContentAlignment="Center" Padding="6,4"
+                     ToolTip="Escolha o arquivo pelo botão 'Escolher destino…'. Se estiver vazio, a captura pergunta o destino." />
+        </Grid>
+
+        <TextBlock Grid.Row="4" x:Name="StatusText" Text="Pronto." Margin="0,0,0,6"
+                   TextWrapping="Wrap" />
+
+        <TextBlock Grid.Row="5" Text="Diagnóstico" FontWeight="SemiBold" Margin="0,0,0,4" />
+
+        <TextBox Grid.Row="6" x:Name="LogBox" IsReadOnly="True"
+                 FontFamily="Consolas" FontSize="11"
+                 VerticalScrollBarVisibility="Auto"
+                 HorizontalScrollBarVisibility="Auto"
+                 AcceptsReturn="True" TextWrapping="NoWrap" />
+    </Grid>
+</Window>
