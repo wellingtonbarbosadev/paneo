@@ -18,24 +18,22 @@ Each remote application behaves like a first-class citizen on your Mac: complete
 
 ```mermaid
 flowchart LR
-    subgraph Windows["Windows Host (C# / .NET 10)"]
+    subgraph Windows ["Windows Host (C# / .NET 10)"]
         WGC["Windows.Graphics.Capture"] --> D3D["D3D11 Staging Texture<br/>(1.65 ms copy)"]
-        D3D --> NV12["Parallel BGRA → NV12"]
+        D3D --> NV12["Parallel BGRA to NV12"]
         NV12 --> MFT["Media Foundation<br/>Low-Latency H.264 MFT"]
-        MFT --> HostTLS["TLS v2 Server<br/>(Port 9443)"]
-        InputHandler["RemoteInput<br/>(SendInput, Topmost, Popups)"] <-- HostTLS
+        MFT --> HostTLS["TLS Server<br/>(Port 9443)"]
+        HostTLS --> InputHandler["RemoteInput<br/>(SendInput, Topmost, Popups)"]
     end
 
-    subgraph Network["Local Network / VPN"]
-        HostTLS <== "Binary Framing v2 (H.264 + Control)" ==> ClientTLS["TLS Client (Cert Pinned)"]
-    end
-
-    subgraph Mac["macOS Client (Swift 6 / AppKit)"]
-        ClientTLS --> VT["Apple VideoToolbox<br/>(Hardware Decoder)"]
+    subgraph Mac ["macOS Client (Swift 6 / AppKit)"]
+        ClientTLS["TLS Client<br/>(Cert Pinned)"] --> VT["Apple VideoToolbox<br/>(Hardware Decoder)"]
         VT --> DisplayLayer["AVSampleBufferDisplayLayer<br/>(Metal Direct)"]
         DisplayLayer --> GlassUI["Liquid Glass UI<br/>(Thumbnail Switcher & Video)"]
-        GlassUI -- "Mouse, Hover, Keyboard, Unicode" --> ClientTLS
+        GlassUI --> |"Mouse, Keyboard, Hover"| ClientTLS
     end
+
+    HostTLS <--> |"Binary Protocol v2<br/>(H.264 + Control over TLS)"| ClientTLS
 ```
 
 ---
