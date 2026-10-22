@@ -5,10 +5,12 @@ using System.Text.Json;
 namespace WindowProbe.Remote;
 
 /// <summary>Entrada atômica limitada à janela autorizada; nunca registra texto.</summary>
-internal sealed class RemoteInput(IntPtr hwnd) : IDisposable
+internal sealed class RemoteInput : IDisposable
 {
-    private readonly Process process = TargetProcess(hwnd);
+    private readonly IntPtr hwnd;
+    private readonly Process process;
     private readonly object inputGate = new();
+    private readonly bool wasTopmostOriginally;
     private string? heldButton;
     private Timer? releaseTimer;
 
@@ -19,6 +21,15 @@ internal sealed class RemoteInput(IntPtr hwnd) : IDisposable
     public bool AllowHover { get; set; } = true;
 
     private bool allowHover => AllowHover;
+
+    public RemoteInput(IntPtr hwnd)
+    {
+        this.hwnd = hwnd;
+        this.process = TargetProcess(hwnd);
+        this.wasTopmostOriginally = CheckIsTopmost(hwnd);
+        ApplyTopmost();
+    }
+
     private static Process TargetProcess(IntPtr hwnd)
     {
         GetWindowThreadProcessId(hwnd, out uint pid);
@@ -28,7 +39,14 @@ internal sealed class RemoteInput(IntPtr hwnd) : IDisposable
     }
     public void Dispose()
     {
-        lock (inputGate) { ReleaseButton(); releaseTimer?.Dispose(); releaseTimer = null; process.Dispose(); }
+        lock (inputGate)
+        {
+            ReleaseButton();
+            releaseTimer?.Dispose();
+            releaseTimer = null;
+            RestoreTopmost();
+            process.Dispose();
+        }
     }
     private void ReleaseButton()
     {
@@ -39,9 +57,59 @@ internal sealed class RemoteInput(IntPtr hwnd) : IDisposable
         releaseTimer?.Change(Timeout.Infinite, Timeout.Infinite);
     }
     internal static void Activate(IntPtr window) => SetForegroundWindow(window);
-    // Melhor esforço: alterna para a janela sem lançar exceção se o Windows negar o foco.
-    private static void BringToForeground(IntPtr hwnd)
+
+    private const int GWL_EXSTYLE = -20;
+    private const uint WS_EX_TOPMOST = 0x00000008;
+
+    private static readonly IntPtr HWND_TOPMOST = new(-1);
+    private static readonly IntPtr HWND_NOTOPMOST = new(-2);
+    private const uint SWP_NOSIZE = 0x0001;
+    private const uint SWP_NOMOVE = 0x0002;
+    private const uint SWP_NOACTIVATE = 0x0010;
+    private const uint SWP_SHOWWINDOW = 0x0040;
+
+    private static bool CheckIsTopmost(IntPtr window)
     {
+        if (!IsWindow(window)) return false;
+        long exStyle = IntPtr.Size == 8
+            ? GetWindowLongPtr64(window, GWL_EXSTYLE).ToInt64()
+            : GetWindowLong32(window, GWL_EXSTYLE).ToInt64();
+        return (exStyle & WS_EX_TOPMOST) != 0;
+    }
+
+    public void ApplyTopmost()
+    {
+        if (IsWindow(hwnd))
+        {
+            SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+        }
+    }
+
+    private void RestoreTopmost()
+    {
+        if (!wasTopmostOriginally && IsWindow(hwnd))
+        {
+            SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+    }
+
+    private bool IsAllowedHit(IntPtr hit)
+    {
+        if (hit == IntPtr.Zero) return false;
+        if (hit == hwnd) return true;
+        if (GetAncestor(hit, 2) == hwnd) return true; // GA_ROOT
+        if (GetAncestor(hit, 3) == hwnd) return true; // GA_ROOTOWNER
+        if (GetWindowThreadProcessId(hit, out uint hitPid) != 0 && hitPid == (uint)process.Id) return true;
+        return false;
+    }
+
+    // Melhor esforço: alterna para a janela sem lançar exceção se o Windows negar o foco.
+    private void BringToForeground(IntPtr hwnd)
+    {
+        // Já em primeiro plano: não repete SetWindowPos/SetForegroundWindow a
+        // cada evento contínuo (scroll/tecla/arraste) na mesma janela focada.
+        if (GetForegroundWindow() == hwnd) return;
+        ApplyTopmost();
         SetForegroundWindow(hwnd);
         WaitForForeground(hwnd, 250);
         if (GetForegroundWindow() == hwnd) return;
@@ -78,6 +146,12 @@ internal sealed class RemoteInput(IntPtr hwnd) : IDisposable
     [DllImport("user32.dll")] private static extern int GetSystemMetrics(int index);
     [DllImport("user32.dll")] private static extern IntPtr WindowFromPoint(Point point);
     [DllImport("user32.dll")] private static extern IntPtr GetAncestor(IntPtr hwnd, uint flags);
+    [DllImport("user32.dll", EntryPoint = "GetWindowLongW", SetLastError = true)]
+    private static extern IntPtr GetWindowLong32(IntPtr hWnd, int nIndex);
+    [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW", SetLastError = true)]
+    private static extern IntPtr GetWindowLongPtr64(IntPtr hWnd, int nIndex);
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
     [DllImport("dwmapi.dll")] private static extern int DwmGetWindowAttribute(IntPtr hwnd, int attr, out Rect rect, int size);
 
     private static Input Keyboard(ushort vk, bool up = false, ushort scan = 0, bool unicode = false) => new()
@@ -112,7 +186,13 @@ internal sealed class RemoteInput(IntPtr hwnd) : IDisposable
         int boundsResult = DwmGetWindowAttribute(hwnd, 9, out var rect, Marshal.SizeOf<Rect>());
         if (boundsResult < 0) return;
         var point = new Point { X = rect.L + (int)(x * (rect.R - rect.L)), Y = rect.T + (int)(y * (rect.B - rect.T)) };
-        if (GetAncestor(WindowFromPoint(point), 2) != hwnd) return;
+        IntPtr hit = WindowFromPoint(point);
+        if (!IsAllowedHit(hit))
+        {
+            ApplyTopmost();
+            hit = WindowFromPoint(point);
+            if (!IsAllowedHit(hit)) return;
+        }
         MoveCursor(point.X, point.Y);
     }
 
@@ -175,8 +255,15 @@ internal sealed class RemoteInput(IntPtr hwnd) : IDisposable
             int boundsResult = DwmGetWindowAttribute(hwnd, 9, out var rect, Marshal.SizeOf<Rect>());
             if (boundsResult < 0) throw new InvalidOperationException("Não foi possível obter os limites da janela.");
             var point = new Point { X = rect.L + (int)(x * (rect.R - rect.L)), Y = rect.T + (int)(y * (rect.B - rect.T)) };
-            if (GetAncestor(WindowFromPoint(point), 2) != hwnd)
-                throw new InvalidOperationException("Ponto coberto por outra janela; entrada recusada.");
+            IntPtr hit = WindowFromPoint(point);
+            if (!IsAllowedHit(hit))
+            {
+                ApplyTopmost();
+                BringWindowToTop(hwnd);
+                hit = WindowFromPoint(point);
+                if (!IsAllowedHit(hit))
+                    throw new InvalidOperationException("Ponto coberto por outra janela; entrada recusada.");
+            }
             if (!SetCursorPos(point.X, point.Y)) throw new InvalidOperationException("Não foi possível posicionar o cursor.");
             if (type == "pointer")
             {

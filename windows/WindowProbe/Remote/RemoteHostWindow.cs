@@ -31,6 +31,12 @@ internal sealed class RemoteHostWindow : Window
     private readonly CheckBox allowHover = new() { Content = "Permitir que o Mac mova o cursor deste PC (hover)", IsChecked = true };
     private readonly TextBlock status = new() { Text = "Parado", TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 8, 0, 0) };
     private readonly List<RemoteServer> servers = [];
+    /// <summary>
+    /// Mantém a tela acordada enquanto o host está aberto. Sem isso o monitor
+    /// entra em stand-by (o timeout é curto) e o WGC para de entregar quadros,
+    /// deixando o Mac com a última imagem. Solto ao fechar a janela.
+    /// </summary>
+    private readonly DisplayWakeLock hostWake = new();
     private readonly Mutex hostMutex = new(false, @"Global\RemoteDesktop-PairedHost-" + System.Security.Principal.WindowsIdentity.GetCurrent().User!.Value);
 
     private HostState? state;
@@ -150,6 +156,7 @@ internal sealed class RemoteHostWindow : Window
             e.Cancel = true;
             closing = true;
             await StopAllAsync();
+            hostWake.Dispose();
             Close();
         };
     }

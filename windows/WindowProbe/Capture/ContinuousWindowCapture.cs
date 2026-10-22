@@ -22,7 +22,12 @@ public sealed record CapturedFrame(
     TimeSpan Elapsed,
     TimeSpan EncodeDuration);
 
-/// <summary>Quadro cru em BGRA (memória do sistema), usado pelo encoder H.264.</summary>
+/// <summary>
+/// Quadro cru em BGRA (memória do sistema), usado pelo encoder H.264.
+/// No caminho contínuo, <see cref="RawPixelFrame.Bgra"/> pode ser o mesmo array
+/// do quadro anterior reaproveitado; o consumidor não deve retê-lo além do
+/// retorno do callback.
+/// </summary>
 public sealed record RawPixelFrame(
     long Sequence,
     byte[] Bgra,
@@ -63,6 +68,18 @@ public sealed class ContinuousCaptureOptions
 
     /// <summary>Recebe cada quadro cru quando <see cref="RawPixels"/> está ligado.</summary>
     public Func<RawPixelFrame, CancellationToken, Task>? RawFrame { get; init; }
+
+    /// <summary>
+    /// Filtra antes da cópia GPU/CPU; evita copiar quadros fora da cadência.
+    /// Recebe o instante monotônico do quadro.
+    /// </summary>
+    public Func<TimeSpan, bool>? AcceptFrame { get; init; }
+
+    /// <summary>
+    /// Diagnóstico opcional das provas de desempenho: recebe o tempo do
+    /// callback de entrega. Nulo mantém o caminho do produto.
+    /// </summary>
+    public Action<TimeSpan, TimeSpan>? Timings { get; init; }
 }
 
 /// <summary>
@@ -175,7 +192,28 @@ public static class ContinuousWindowCapture
             long sequence = 0;
             int coalesced = 0;
             int resizes = 0;
+            // Buffer de pixels crus reaproveitado entre quadros (evita alocar
+            // ~8 MB por frame; realoca apenas quando o tamanho muda).
+            byte[]? pixels = null;
+            int lastWidth = 0;
+            int lastHeight = 0;
+            int lastStride = 0;
+            bool hasPixels = false;
 
+            // Sinal de frame novo: substitui o polling cego por espera com prazo.
+            // Um sinal pendente basta; o consumo na espera zera CurrentCount.
+            var frameSignal = new SemaphoreSlim(0, 1);
+            TypedEventHandler<Direct3D11CaptureFramePool, object> onFrameArrived = (_, _) =>
+            {
+                // Libera só quando não há sinal pendente: evita
+                // SemaphoreFullException em corrida entre arrivals; descarta em
+                // silêncio quando o fluxo já está encerrando.
+                try { if (frameSignal.CurrentCount == 0) frameSignal.Release(); }
+                catch (SemaphoreFullException) { }
+                catch (ObjectDisposedException) { /* fluxo já encerrando */ }
+            };
+
+            pool.FrameArrived += onFrameArrived;
             item.Closed += onClosed;
             try
             {
@@ -207,9 +245,44 @@ public static class ContinuousWindowCapture
                         throw new CaptureException("A janela foi ocultada ou fechada durante a captura contínua.");
                     }
 
+                    // No modo RawPixels, depois do primeiro quadro capturado,
+                    // cadencia pelo pacer de 60 FPS antes de drenar o pool:
+                    // assim nem descarta um frame novo por chegar fora de slot,
+                    // nem cai para 1-15 FPS quando a janela está parada (ex.: Discord).
+                    if (options.RawPixels && options.RawFrame is not null && hasPixels && options.AcceptFrame is not null)
+                    {
+                        if (!options.AcceptFrame(watch.Elapsed))
+                        {
+                            await frameSignal.WaitAsync(TimeSpan.FromMilliseconds(2), token).ConfigureAwait(false);
+                            continue;
+                        }
+                    }
+
+                    while (frameSignal.Wait(0)) { }
                     using Direct3D11CaptureFrame? frame = TakeNewestFrame(pool, ref coalesced);
                     if (frame is null)
                     {
+                        if (options.RawPixels && options.RawFrame is not null && hasPixels && pixels is not null)
+                        {
+                            TimeSpan repeatAt = watch.Elapsed;
+                            long repeatStart = options.Timings is null ? 0 : Stopwatch.GetTimestamp();
+                            var rawRepeat = new RawPixelFrame(
+                                sequence + 1,
+                                pixels,
+                                lastWidth,
+                                lastHeight,
+                                lastStride,
+                                repeatAt);
+                            await options.RawFrame(rawRepeat, token).ConfigureAwait(false);
+                            if (options.Timings is not null)
+                            {
+                                options.Timings(TimeSpan.Zero, Stopwatch.GetElapsedTime(repeatStart));
+                            }
+                            sequence++;
+                            lastFrameAt = watch.Elapsed;
+                            continue;
+                        }
+
                         if (watch.Elapsed - lastFrameAt >= options.FrameTimeout)
                         {
                             throw new CaptureTimeoutException(
@@ -217,7 +290,7 @@ public static class ContinuousWindowCapture
                                 "A janela pode estar estática, indisponível ou protegida.");
                         }
 
-                        await Task.Delay(PollInterval, token).ConfigureAwait(false);
+                        await frameSignal.WaitAsync(PollInterval, token).ConfigureAwait(false);
                         continue;
                     }
 
@@ -234,37 +307,70 @@ public static class ContinuousWindowCapture
                         frame.Dispose();
                         pool.Recreate(device.WinRtDevice, PixelFormat, options.BufferCount, frameSize);
                         currentSize = frameSize;
+                        hasPixels = false;
                         resizes++;
                         lastFrameAt = watch.Elapsed;
                         log?.Report($"Pool ajustado para o frame {frameSize.Width}x{frameSize.Height}.");
                         continue;
                     }
 
-                    using SoftwareBitmap bitmap = await SoftwareBitmap
-                        .CreateCopyFromSurfaceAsync(frame.Surface).AsTask(token).ConfigureAwait(false);
-                    token.ThrowIfCancellationRequested();
+                    TimeSpan capturedAt = watch.Elapsed;
+                    lastFrameAt = capturedAt;
+                    if (!(options.RawPixels && options.RawFrame is not null && hasPixels)
+                        && options.AcceptFrame is not null && !options.AcceptFrame(capturedAt))
+                    {
+                        continue;
+                    }
 
+                    long callbackStart = options.Timings is null ? 0 : Stopwatch.GetTimestamp();
                     if (options.RawPixels && options.RawFrame is not null)
                     {
-                        int stride = bitmap.PixelWidth * 4;
-                        var pixels = new byte[stride * bitmap.PixelHeight];
-                        // CopyToBuffer exige um IBuffer do tamanho do bitmap (BGRA empacotado).
-                        bitmap.CopyToBuffer(pixels.AsBuffer());
+                        long copyStart = Stopwatch.GetTimestamp();
+                        if (!device.TryCopySurfaceToBgra(frame.Surface, ref pixels, out int rawWidth, out int rawHeight, out int rawStride)
+                            || pixels is null)
+                        {
+                            using SoftwareBitmap fallbackBitmap = await SoftwareBitmap
+                                .CreateCopyFromSurfaceAsync(frame.Surface).AsTask(token).ConfigureAwait(false);
+                            token.ThrowIfCancellationRequested();
+                            rawWidth = fallbackBitmap.PixelWidth;
+                            rawHeight = fallbackBitmap.PixelHeight;
+                            rawStride = rawWidth * 4;
+                            int neededLength = rawStride * rawHeight;
+                            if (pixels is null || pixels.Length != neededLength)
+                            {
+                                pixels = new byte[neededLength];
+                            }
+                            fallbackBitmap.CopyToBuffer(pixels.AsBuffer());
+                        }
+                        TimeSpan copyElapsed = Stopwatch.GetElapsedTime(copyStart);
+                        frame.Dispose();
+
+                        lastWidth = rawWidth;
+                        lastHeight = rawHeight;
+                        lastStride = rawStride;
+                        hasPixels = true;
+
                         var raw = new RawPixelFrame(
                             sequence + 1,
                             pixels,
-                            bitmap.PixelWidth,
-                            bitmap.PixelHeight,
-                            stride,
-                            watch.Elapsed);
+                            rawWidth,
+                            rawHeight,
+                            rawStride,
+                            capturedAt);
 
-                        bitmap.Dispose();
-                        frame.Dispose();
                         await options.RawFrame(raw, token).ConfigureAwait(false);
+                        if (options.Timings is not null)
+                        {
+                            options.Timings(copyElapsed, Stopwatch.GetElapsedTime(callbackStart));
+                        }
                         sequence++;
                         lastFrameAt = watch.Elapsed;
                         continue;
                     }
+
+                    using SoftwareBitmap bitmap = await SoftwareBitmap
+                        .CreateCopyFromSurfaceAsync(frame.Surface).AsTask(token).ConfigureAwait(false);
+                    token.ThrowIfCancellationRequested();
 
                     var encodeWatch = Stopwatch.StartNew();
                     byte[] png = await PngWriter.EncodeAsync(bitmap, token).ConfigureAwait(false);
@@ -299,6 +405,10 @@ public static class ContinuousWindowCapture
             }
             finally
             {
+                // Desassina antes de descartar: o handler tolera corrida com
+                // um sinal em curso (ObjectDisposedException capturado nele).
+                pool.FrameArrived -= onFrameArrived;
+                frameSignal.Dispose();
                 try { item.Closed -= onClosed; }
                 catch { /* melhor esforço ao encerrar */ }
             }

@@ -21,6 +21,12 @@ namespace WindowProbe.Capture
         public TimeSpan FrameTimeout { get; init; } = TimeSpan.FromSeconds(10);
         public int BufferCount { get; init; } = 2;
         public bool CaptureCursor { get; init; }
+        /// <summary>Filtro de cadência do produto: descarta antes de entregar.</summary>
+        public Func<TimeSpan, bool>? AcceptFrame { get; init; }
+
+        /// <summary>Métrica opcional do pipeline; nula no teste de protocolo.</summary>
+        public Action<TimeSpan, TimeSpan>? Timings { get; init; }
+
         public bool RawPixels { get; init; }
         public Func<RawPixelFrame, CancellationToken, Task>? RawFrame { get; init; }
     }
@@ -66,6 +72,11 @@ namespace WindowProbe.Capture
             while (true)
             {
                 ct.ThrowIfCancellationRequested();
+                if (options?.AcceptFrame is not null && !options.AcceptFrame(watch.Elapsed))
+                {
+                    await Task.Delay(1, ct);
+                    continue;
+                }
                 if (options is not null && options.RawPixels && options.RawFrame is not null)
                 {
                     // Quadro BGRA 320x240 sintético (múltiplo de 16, aceito pelo encoder).

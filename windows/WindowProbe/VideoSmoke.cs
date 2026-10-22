@@ -3,6 +3,7 @@ using System.Text.Json;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Interop;
+using System.Windows.Media;
 using System.Windows.Threading;
 using WindowProbe.Capture;
 using WindowProbe.Remote;
@@ -26,15 +27,26 @@ internal static class VideoSmoke
         var window = new Window
         {
             Title = "RemoteDesktop — prova de vídeo",
-            Width = 640,
-            Height = 360,
+            Width = 1920,
+            Height = 1080,
             Topmost = true,
+            Left = 0,
+            Top = 0,
+            WindowStyle = WindowStyle.None,
+            ResizeMode = ResizeMode.NoResize,
             Content = panel
         };
 
-        var timer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(33) };
         int ticks = 0;
-        timer.Tick += (_, _) => counter.Text = "Quadro " + ++ticks;
+        TimeSpan lastRender = TimeSpan.MinValue;
+        EventHandler render = (_, e) =>
+        {
+            if (e is RenderingEventArgs args && args.RenderingTime != lastRender)
+            {
+                lastRender = args.RenderingTime;
+                counter.Text = "Quadro " + ++ticks;
+            }
+        };
 
         MfH264Encoder? encoder = null;
         int captured = 0;
@@ -46,23 +58,29 @@ internal static class VideoSmoke
         string? failure = null;
         var watch = Stopwatch.StartNew();
 
+        using var wake = new DisplayWakeLock();
+        var pacer = new VideoFramePacer(RemoteServer.VideoFps);
         try
         {
             window.Show();
+            var dpi = VisualTreeHelper.GetDpi(window);
+            window.Width = 1920 / dpi.DpiScaleX;
+            window.Height = 1080 / dpi.DpiScaleY;
             window.Activate();
-            timer.Start();
+            CompositionTarget.Rendering += render;
             await Task.Delay(700);
 
             var options = new ContinuousCaptureOptions
             {
                 FrameTimeout = TimeSpan.FromSeconds(5),
                 RawPixels = true,
+                AcceptFrame = pacer.TryAccept,
                 RawFrame = (raw, ct) =>
                 {
                     captured++;
                     if (encoder is null)
                     {
-                        encoder = new MfH264Encoder(raw.Width, raw.Height, 30, 8_000_000);
+                        encoder = new MfH264Encoder(raw.Width, raw.Height, RemoteServer.VideoFps, 12_000_000);
                     }
 
                     long start = Stopwatch.GetTimestamp();
@@ -82,7 +100,9 @@ internal static class VideoSmoke
                 }
             };
 
-            using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(6));
+            ticks = 0;
+            watch.Restart();
+            using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(15));
             try
             {
                 await ContinuousWindowCapture.RunAsync(
@@ -106,10 +126,15 @@ internal static class VideoSmoke
                 bytes,
                 annexB,
                 averageEncodeMs = captured > 0 ? Math.Round(encodeMs / captured, 2) : 0,
+                displayWakeRequested = wake.Acquired,
+                targetFps = RemoteServer.VideoFps,
                 effectiveFps = Math.Round(accessUnits / seconds, 1),
                 encoder = encoder?.Name ?? "desconhecido",
                 hardware = encoder?.IsHardware ?? false,
-                width = encoder is null ? 0 : 640,
+                width = encoder?.Width ?? 0,
+                height = encoder?.Height ?? 0,
+                durationSeconds = Math.Round(seconds, 3),
+                sourceRenderTicks = ticks,
                 failure
             });
 
@@ -123,7 +148,7 @@ internal static class VideoSmoke
         }
         finally
         {
-            timer.Stop();
+            CompositionTarget.Rendering -= render;
             encoder?.Dispose();
             window.Close();
         }

@@ -184,8 +184,10 @@ final class H264Decoder {
             Task { @MainActor in
                 if let box {
                     self.enqueue(pixelBuffer: box)
+                    self.onDecoded?(self.pixelSize)
+                } else {
+                    self.onError?("O decodificador não entregou imagem para este quadro.")
                 }
-                self.onDecoded?(self.pixelSize)
             }
         }
 
@@ -221,7 +223,7 @@ final class H264Decoder {
         }
 
         var sample: CMSampleBuffer?
-        var timing = CMSampleTimingInfo(duration: CMTime(value: 1, timescale: 30),
+        var timing = CMSampleTimingInfo(duration: .invalid,
                                          presentationTimeStamp: .invalid,
                                          decodeTimeStamp: .invalid)
         let created = withUnsafePointer(to: &timing) { pointer in
@@ -375,7 +377,7 @@ final class H264Decoder {
         frameIndex += 1
 
         var sample: CMSampleBuffer?
-        var timing = CMSampleTimingInfo(duration: CMTime(value: 1, timescale: 30),
+        var timing = CMSampleTimingInfo(duration: .invalid,
                                          presentationTimeStamp: presentationTime,
                                          decodeTimeStamp: presentationTime)
         let status = CMSampleBufferCreateReady(

@@ -33,6 +33,12 @@ public partial class App : Application
             Shutdown(await Remote.RemoteSmoke.RunAsync(e.Args[1]));
             return;
         }
+        if (e.Args.Length == 2 && e.Args[0] == "--host-performance-smoke")
+        {
+            ShutdownMode = ShutdownMode.OnExplicitShutdown;
+            Shutdown(await Remote.HostSmoke.RunAsync(e.Args[1], performance: true));
+            return;
+        }
         if (e.Args.Length == 2 && e.Args[0] == "--host-smoke")
         {
             ShutdownMode = ShutdownMode.OnExplicitShutdown;
@@ -48,7 +54,7 @@ public partial class App : Application
         if (e.Args.Length == 2 && e.Args[0] == "--encoder-probe")
         {
             ShutdownMode = ShutdownMode.OnExplicitShutdown;
-            Shutdown(await EncoderProbe.RunAsync(e.Args[1]));
+            Shutdown(await Task.Run(() => EncoderProbe.RunAsync(e.Args[1])));
             return;
         }
         if (e.Args.Length == 2 && e.Args[0] == "--video-dump")

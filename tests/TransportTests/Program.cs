@@ -15,6 +15,68 @@ static void Check(bool condition, string message)
     if (!condition) throw new Exception(message);
 }
 
+// A cadência mantém 30/60 FPS com jitter e não libera rajadas após pausas.
+foreach (int targetFps in new[] { 30, 60 })
+foreach (int intervalMs in (targetFps == 30 ? new[] { 16, 17, 32, 33 } : new[] { 8, 9, 15, 16 }))
+{
+    var pacer = new VideoFramePacer(targetFps);
+    int accepted = 0;
+    for (int ms = 0; ms < 10_000; ms += intervalMs)
+        if (pacer.TryAccept(TimeSpan.FromMilliseconds(ms))) accepted++;
+    Check(accepted >= targetFps * 10 - 1 && accepted <= targetFps * 10, $"Cadência incorreta: {accepted} em 10 s ({intervalMs} ms).");
+    Check(pacer.TryAccept(TimeSpan.FromSeconds(20)), "Não retomou após pausa.");
+    Check(!pacer.TryAccept(TimeSpan.FromSeconds(20)), "Aceitou rajada no mesmo instante.");
+}
+Console.WriteLine("PASS cadência de 30/60 FPS com jitter e retomada sem rajadas");
+
+// Solicitação e liberação de energia precisam ocorrer na mesma thread, e o
+// monitor precisa ser acordado uma vez, antes de qualquer espera de vídeo.
+var powerCalls = new List<(uint Flags, int Thread)>();
+int monitorWakes = 0;
+var wakeProbe = new DisplayWakeLock(
+    flags =>
+    {
+        powerCalls.Add((flags, Environment.CurrentManagedThreadId));
+        // O retorno da API é o estado anterior; qualquer valor não nulo indica
+        // que a chamada foi aceita.
+        return DisplayWakeLock.Active;
+    },
+    () => monitorWakes++);
+Check(wakeProbe.Acquired, "Solicitação de energia não adquirida.");
+Check(wakeProbe.MonitorWoken && monitorWakes == 1, "Monitor não foi acordado exatamente uma vez.");
+wakeProbe.Dispose();
+wakeProbe.Dispose();
+Check(powerCalls.Count == 2 && powerCalls[0].Flags == DisplayWakeLock.Active
+    && powerCalls[1].Flags == DisplayWakeLock.Continuous
+    && powerCalls[0].Thread == powerCalls[1].Thread, "Solicitação de energia vazou ou mudou de thread.");
+Check(monitorWakes == 1, "Monitor foi acordado de novo ao liberar.");
+Console.WriteLine("PASS tela acordada, monitor religado e liberação na mesma thread");
+
+// Durante a sessão o pedido é reafirmado e o monitor é reacordado, para cobrir
+// nova entrada em stand-by; ao liberar, para de reafirmar.
+int keepAliveCalls = 0;
+var keepAlive = new DisplayWakeLock(_ => { keepAliveCalls++; return DisplayWakeLock.Active; },
+    () => { }, TimeSpan.FromMilliseconds(20));
+Check(keepAlive.Acquired, "Lock com reafirmação não foi adquirido.");
+Thread.Sleep(200);
+int afterWait = keepAliveCalls;
+Check(afterWait >= 3, $"Pedido de energia não foi reafirmado (chamadas: {afterWait}).");
+Check(keepAlive.MonitorWakeCount >= 3, $"Monitor não foi reacordado (vezes: {keepAlive.MonitorWakeCount}).");
+keepAlive.Dispose();
+int afterDispose = keepAliveCalls;
+Thread.Sleep(120);
+Check(keepAliveCalls == afterDispose, "Pedido de energia continuou após o Dispose.");
+Console.WriteLine("PASS tela sustentada durante a sessão e liberada ao encerrar");
+
+// A API devolve o estado anterior. Qualquer valor não nulo indica chamada
+// aceita; 0 é falha e não pode ser mascarada como sucesso.
+int monitorWakesOnFailure = 0;
+var failedWake = new DisplayWakeLock(_ => 0, () => monitorWakesOnFailure++);
+Check(!failedWake.Acquired, "Lock alegou tela acordada com retorno 0 da API.");
+Check(monitorWakesOnFailure == 0, "Monitor foi acordado mesmo com o pedido recusado.");
+failedWake.Dispose();
+Console.WriteLine("PASS falha do pedido de energia não é mascarada");
+
 const string Pin = "246810";
 var credentials = HostCredentials.Create(Pin);
 var windowList = new WindowDescriptor[]
@@ -316,6 +378,15 @@ try
             Check(pong.GetProperty("type").GetString() == "pong", "pong ausente no modo controle.");
             Console.WriteLine("PASS modo PIN devolve deviceToken no ready");
             Console.WriteLine("PASS role control recebe windows injetado, atende list e ping");
+            // A sessão autenticada deve sobreviver ao prazo inicial de 20 s.
+            for (int heartbeat = 0; heartbeat < 7; heartbeat++)
+            {
+                await Task.Delay(3000, ct);
+                await SendJsonAsync(tls, new { type = "ping" });
+                Check((await ReadJsonAsync(tls)).GetProperty("type").GetString() == "pong",
+                    "Sessão autenticada terminou com o prazo do handshake.");
+            }
+            Console.WriteLine("PASS sessão autenticada permanece ativa após o prazo de handshake");
         }
     }
 

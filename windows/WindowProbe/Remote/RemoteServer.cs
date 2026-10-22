@@ -3,6 +3,7 @@
 global using System.IO;
 
 using System.Buffers.Binary;
+using System.Diagnostics;
 using System.Net;
 using System.Net.Security;
 using System.Net.Sockets;
@@ -50,6 +51,16 @@ internal sealed class RemoteServer : IDisposable
     public int Port => ((IPEndPoint)listener.LocalEndpoint).Port;
     public string? LastFailure { get; private set; }
     public long FramesSent => Interlocked.Read(ref framesSent);
+    /// <summary>Diagnóstico do último pipeline de vídeo (só o smoke lê).</summary>
+    public object? VideoTimings { get; private set; }
+    /// <summary>Diagnóstico do smoke: pedido de energia e de acordar o monitor.</summary>
+    public bool? DisplayAwake { get; private set; }
+    public bool? MonitorWoken { get; private set; }
+    public string? VideoError => lastVideo?.Error;
+
+    public bool VideoIsHardware => lastVideo?.LastHardware ?? false;
+
+    private VideoChannel? lastVideo;
     public long InputsApplied => Interlocked.Read(ref inputsApplied);
     public Action<string>? Status { get; set; }
 
@@ -185,6 +196,8 @@ internal sealed class RemoteServer : IDisposable
         }
 
         if (handshake is null) return;
+        // Após autenticar, cada leitura usa seu próprio prazo de heartbeat.
+        session.CancelAfter(Timeout.InfiniteTimeSpan);
 
         var ready = new Dictionary<string, object?>
         {
@@ -205,7 +218,11 @@ internal sealed class RemoteServer : IDisposable
         else
         {
             Status?.Invoke("Mac autenticado. Compartilhando janela autorizada.");
-            await RunViewAsync(tls, session, handshake.WindowId).ConfigureAwait(false);
+            try { await RunViewAsync(tls, session, handshake.WindowId).ConfigureAwait(false); }
+            finally
+            {
+                if (lastVideo is not null) VideoTimings = lastVideo.TimingSnapshot();
+            }
         }
     }
 
@@ -421,36 +438,78 @@ internal sealed class RemoteServer : IDisposable
         private MfH264Encoder? encoder;
         private int width;
         private int height;
+        private bool preferHardware = true;
 
         public string? Error { get; set; }
         public bool Announced { get; set; }
+        public bool LastHardware { get; private set; }
         public bool EncoderUnavailable { get; private set; }
 
         /// <summary>Contador único de sequência da sessão (PNG e H.264).</summary>
         private uint sequence;
 
-        /// <summary>Instante do último quadro aceito, para pacing de 30 FPS.</summary>
-        private long lastFrameTimestamp;
+        private readonly VideoFramePacer pacer = new(VideoFps);
 
-        /// <summary>Erros de codificação consecutivos antes de desistir do H.264.</summary>
+
         public int ConsecutiveEncodeFailures { get; set; }
-
-        /// <summary>Próximo número de sequência (monotônico na sessão).</summary>
         public uint NextSequence() => Interlocked.Increment(ref sequence);
+        public bool ShouldAcceptFrame(TimeSpan elapsed) => pacer.TryAccept(elapsed);
 
-        /// <summary>
-        /// Aplica o pacing de 30 FPS: o WGC entrega quadros na taxa do monitor,
-        /// mas o encoder está configurado para 30 FPS. Quadros acima da taxa são
-        /// descartados para não gastar CPU com um frame que seria descartado
-        /// pelo MFT de qualquer forma.
-        /// </summary>
-        public bool ShouldAcceptFrame(long timestampMilliseconds)
+        // ---- diagnóstico de desempenho (só lido pelo host-performance-smoke) ----
+
+        private readonly object timingGate = new();
+        private double encodeMsTotal;
+        private double sendMsTotal;
+        private double sendMsMax;
+        private int timedUnits;
+        private int timedFrames;
+        private double copyMsTotal;
+        private double copyMsMax;
+
+        /// <summary>Acumula encode e envio por quadro; custo irrelevante.</summary>
+        public void RecordTiming(TimeSpan encode, TimeSpan send, int units)
         {
-            long minimumInterval = 1000L / VideoFps;
-            long previous = Interlocked.Read(ref lastFrameTimestamp);
-            if (previous != 0 && timestampMilliseconds - previous < minimumInterval) return false;
-            Interlocked.Exchange(ref lastFrameTimestamp, timestampMilliseconds);
-            return true;
+            lock (timingGate)
+            {
+                encodeMsTotal += encode.TotalMilliseconds;
+                sendMsTotal += send.TotalMilliseconds;
+                sendMsMax = Math.Max(sendMsMax, send.TotalMilliseconds);
+                timedFrames++;
+                timedUnits += units;
+            }
+        }
+
+        /// <summary>Cópia GPU/CPU acumulada pelo callback de captura.</summary>
+        public void RecordCopy(TimeSpan copy)
+        {
+            lock (timingGate)
+            {
+                copyMsTotal += copy.TotalMilliseconds;
+                copyMsMax = Math.Max(copyMsMax, copy.TotalMilliseconds);
+            }
+        }
+
+        public object TimingSnapshot() => Snapshot();
+
+        /// <summary>Alimenta a cópia GPU/CPU medida pela captura.</summary>
+        public Action<TimeSpan, TimeSpan> Timings => (copy, _) => RecordCopy(copy);
+
+        private Dictionary<string, object?> Snapshot()
+        {
+            lock (timingGate)
+            {
+                int frames = Math.Max(1, timedFrames);
+                return new()
+                {
+                    ["timedFrames"] = timedFrames,
+                    ["accessUnits"] = timedUnits,
+                    ["copyMsAvg"] = Math.Round(copyMsTotal / frames, 2),
+                    ["copyMsMax"] = Math.Round(copyMsMax, 2),
+                    ["encodeMsAvg"] = Math.Round(encodeMsTotal / frames, 2),
+                    ["sendMsAvg"] = Math.Round(sendMsTotal / frames, 2),
+                    ["sendMsMax"] = Math.Round(sendMsMax, 2),
+                };
+            }
         }
 
         /// <summary>Devolve o encoder do tamanho pedido, recriando quando a janela muda.</summary>
@@ -471,8 +530,14 @@ internal sealed class RemoteServer : IDisposable
 
                 try
                 {
-                    encoder = new MfH264Encoder(newWidth, newHeight, VideoFps, VideoBitrate);
+                    try { encoder = new MfH264Encoder(newWidth, newHeight, VideoFps, VideoBitrate, preferHardware); }
+                    catch when (preferHardware)
+                    {
+                        preferHardware = false;
+                        encoder = new MfH264Encoder(newWidth, newHeight, VideoFps, VideoBitrate, preferHardware: false);
+                    }
                     encoder.RequestKeyframe();
+                    LastHardware = encoder.IsHardware;
                     width = newWidth;
                     height = newHeight;
                     return encoder;
@@ -484,6 +549,18 @@ internal sealed class RemoteServer : IDisposable
                     Error = ex.Message;
                     return null;
                 }
+            }
+        }
+
+        public void UseSoftwareEncoder()
+        {
+            lock (gate)
+            {
+                preferHardware = false;
+                LastHardware = false;
+                encoder?.Dispose();
+                encoder = null;
+                Announced = false;
             }
         }
 
@@ -502,8 +579,11 @@ internal sealed class RemoteServer : IDisposable
         }
     }
 
-    private const int VideoFps = 30;
-    private const int VideoBitrate = 8_000_000;
+    internal const int VideoFps = 60;
+    private const int VideoBitrate = 12_000_000;
+
+    /// <summary>Falhas seguidas do encoder de hardware antes de cair para software.</summary>
+    private const int HardwareFallbackFailures = 5;
 
     /// Resolve a janela que o Mac pediu. O identificador é o próprio handle da
     /// janela, publicado na lista `windows`.
@@ -537,9 +617,14 @@ internal sealed class RemoteServer : IDisposable
         }
 
         IntPtr windowHandle = target.Value;
+        using var wake = new DisplayWakeLock();
+        DisplayAwake = wake.Acquired;
+        MonitorWoken = wake.MonitorWoken;
+        Status?.Invoke($"Sessão view: tela acordada={wake.Acquired} monitor religado={wake.MonitorWoken}");
         using var input = new RemoteInput(windowHandle) { AllowHover = allowHover };
         using var mediaInFlight = new SemaphoreSlim(2, 2);
         var video = new VideoChannel();
+        lastVideo = video;
         video.RequestKeyframe();
         Task receive = ReceiveViewAsync(tls, input, video, session);
 
@@ -564,8 +649,16 @@ internal sealed class RemoteServer : IDisposable
         catch (OperationCanceledException) when (session.IsCancellationRequested) { }
         catch (CaptureException ex)
         {
-            LastFailure ??= ex.GetType().Name;
+            LastFailure = ex.GetType().Name + ": " + ex.Message;
             Status?.Invoke("Captura encerrada: " + ex.Message);
+        }
+        catch (Exception ex)
+        {
+            // Falha inesperada do pipeline não pode sair silenciosa: o relatório
+            // de desempenho precisa do motivo (HRESULT, tipo e mensagem).
+            string hr = ex is System.Runtime.InteropServices.COMException com ? " 0x" + com.HResult.ToString("X8") : "";
+            LastFailure = ex.GetType().Name + hr + ": " + ex.Message.Replace("\r\n", " ");
+            Status?.Invoke("Captura encerrada: " + LastFailure);
         }
         finally
         {
@@ -585,15 +678,20 @@ internal sealed class RemoteServer : IDisposable
         IntPtr windowHandle,
         CancellationTokenSource session)
     {
+        using var pipelineStop = CancellationTokenSource.CreateLinkedTokenSource(session.Token);
         var options = new ContinuousCaptureOptions
         {
             FrameTimeout = TimeSpan.FromHours(8),
             RawPixels = raw,
+            // Filtro antes da cópia GPU/CPU: só quadros na cadência do produto
+            // pagam a cópia e o encode.
+            AcceptFrame = raw ? video.ShouldAcceptFrame : null,
             // O cursor do PC precisa entrar no quadro: o Mac esconde o cursor
             // local sobre a imagem, então sem isso não há ponteiro na tela.
             CaptureCursor = true,
-            RawFrame = raw ? (Func<RawPixelFrame, CancellationToken, Task>)((rawFrame, ct) =>
-                SendVideoFrameAsync(tls, video, rawFrame, mediaInFlight, ct)) : null
+            RawFrame = raw ? (rawFrame, ct) =>
+                SendVideoFrameAsync(tls, video, rawFrame, mediaInFlight, ct) : null,
+            Timings = raw ? video.Timings : null
         };
 
         await ContinuousWindowCapture.RunAsync(
@@ -623,7 +721,7 @@ internal sealed class RemoteServer : IDisposable
             },
             options,
             null,
-            session.Token).ConfigureAwait(false);
+            pipelineStop.Token).ConfigureAwait(false);
     }
 
     private async Task SendVideoFrameAsync(
@@ -636,9 +734,7 @@ internal sealed class RemoteServer : IDisposable
         if (rawFrame.Width is <= 0 or > ushort.MaxValue || rawFrame.Height is <= 0 or > ushort.MaxValue) return;
 
         long pts = (long)rawFrame.Elapsed.TotalMilliseconds;
-
-        // Pacing de 30 FPS: o WGC pode entregar mais quadros que o encoder usa.
-        if (!video.ShouldAcceptFrame(pts)) return;
+        long encodeStart = Stopwatch.GetTimestamp();
 
         MfH264Encoder? encoder = video.EnsureEncoder(rawFrame.Width, rawFrame.Height, out string? failure);
         if (encoder is null)
@@ -656,7 +752,7 @@ internal sealed class RemoteServer : IDisposable
             video.Announced = true;
             await SendControlAsync(
                 tls,
-                new { type = "video", codec = "h264", width = encodedWidth, height = encodedHeight },
+                new { type = "video", codec = "h264", width = encodedWidth, height = encodedHeight, fps = VideoFps, hardware = encoder.IsHardware },
                 ct).ConfigureAwait(false);
         }
 
@@ -670,14 +766,23 @@ internal sealed class RemoteServer : IDisposable
         {
             // Falha de codificação não encerra a sessão: descarta o quadro,
             // pede keyframe e conta. Depois de muitas falhas seguidas, o
-            // pipeline cai para PNG.
+            // pipeline cai para PNG. Uma falha isolada do encoder de hardware
+            // mantém o caminho; só a insistência troca para software, para não
+            // reativar o MFT a cada quadro.
             video.ConsecutiveEncodeFailures++;
-            video.Error = ex.Message;
+            video.Error = "encode: " + ex.Message;
             video.RequestKeyframe();
+            if (encoder.IsHardware && video.ConsecutiveEncodeFailures >= HardwareFallbackFailures)
+            {
+                video.UseSoftwareEncoder();
+                return;
+            }
             if (video.ConsecutiveEncodeFailures >= 30) throw new VideoEncoderUnavailable();
             return;
         }
 
+        TimeSpan encode = Stopwatch.GetElapsedTime(encodeStart);
+        long sendStart = Stopwatch.GetTimestamp();
         foreach (EncodedAccessUnit unit in units)
         {
             byte[] framed = FrameMedia(
@@ -697,6 +802,7 @@ internal sealed class RemoteServer : IDisposable
             }
             finally { mediaInFlight.Release(); }
         }
+        video.RecordTiming(encode, Stopwatch.GetElapsedTime(sendStart), units.Count);
     }
 
     private async Task ReceiveViewAsync(SslStream tls, RemoteInput input, VideoChannel video, CancellationTokenSource session)

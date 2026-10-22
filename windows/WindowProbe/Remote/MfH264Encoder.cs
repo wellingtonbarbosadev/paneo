@@ -8,6 +8,15 @@ namespace WindowProbe.Remote;
 /// fallback). Entrada em BGRA (memória do sistema), conversão NV12 na CPU para
 /// evitar interop D3D11 adicional nesta primeira versão. Sem B-frames, CBR e
 /// keyframe sob demanda (docs/VIDEO.md).
+///
+/// MFTs de hardware (ex.: "NVIDIA H.264 Encoder MFT") são assíncronos: depois
+/// de ativar, o atributo MF_TRANSFORM_ASYNC é lido e, quando verdadeiro,
+/// MF_TRANSFORM_ASYNC_UNLOCK é gravado antes de qualquer configuração. Os
+/// eventos NeedInput/HaveOutput/DrainComplete são consumidos por uma thread
+/// dedicada via IMFMediaEventGenerator, e ProcessInput/ProcessOutput só são
+/// chamados quando o MFT pediu, conforme a documentação de MFTs assíncronas.
+/// Todas as esperas têm prazo; nenhuma chamada de processamento bloqueia sem
+/// limite.
 /// </summary>
 internal sealed class MfH264Encoder : IDisposable
 {
@@ -17,10 +26,30 @@ internal sealed class MfH264Encoder : IDisposable
     private const uint MFT_ENUM_FLAG_SYNCMFT = 0x1;
     private const uint MFT_ENUM_FLAG_ASYNCMFT = 0x2;
     private const uint MFT_ENUM_FLAG_SORTANDFILTER = 0x40;
-    private const uint MFT_ENUM_FLAG_TRANSCODE_ONLY = 0x8;
 
     private const uint MF_E_TRANSFORM_NEED_MORE_INPUT = 0xC00D6D72;
     private const uint MF_E_TRANSFORM_STREAM_CHANGE = 0xC00D6D61;
+
+    /// <summary>MFT_OUTPUT_STREAM_PROVIDES_SAMPLES (mftransform.h).</summary>
+    private const uint MFT_OUTPUT_STREAM_PROVIDES_SAMPLES = 0x100;
+
+    private const int E_UNEXPECTED = unchecked((int)0x8000FFFF);
+    private const int MF_E_NOTACCEPTING = unchecked((int)0xC00D36B5);
+    private const int MF_E_TRANSFORM_ASYNC_LOCKED = unchecked((int)0xC00D6D77);
+
+    private const int MEError = 1;
+    private const int METransformNeedInput = 601;
+    private const int METransformHaveOutput = 602;
+    private const int METransformDrainComplete = 603;
+    private const int METransformMarker = 604;
+    private const int METransformInputStreamStateChanged = 605;
+
+    // Prazos curtos: um encoder saudável responde em microssegundos. Estourar
+    // o prazo devolve erro ao chamador em vez de travar o pipeline.
+    private const int InputEventTimeoutMs = 250;
+    private const int OutputEventTimeoutMs = 2;
+    private const int DrainTimeoutMs = 2_000;
+    private const int PumpStopTimeoutMs = 1_000;
 
     private const int MFVideoInterlace_Progressive = 2;
 
@@ -29,10 +58,22 @@ internal sealed class MfH264Encoder : IDisposable
     private readonly int sourceWidth;
     private readonly int sourceHeight;
     private readonly int fps;
+    private readonly bool isAsync;
     private readonly object gate = new();
     private IMFTransform? transform;
+    private IMFMediaEventGenerator? eventGenerator;
+    private Thread? eventPump;
+    private ManualResetEventSlim? pumpStop;
+    private readonly object eventLock = new();
+    private int needInputCount;
+    private int haveOutputCount;
+    private bool drainCompleteSignaled;
+    private bool awaitingDrain;
+    private int pumpError;
     private bool disposed;
     private long frameIndex;
+    /// <summary>Buffer NV12 reaproveitado: evita alocar 3 MB por quadro.</summary>
+    private byte[]? nv12Buffer;
     private uint outputStreamFlags;
     private uint outputBufferSize;
 
@@ -48,9 +89,11 @@ internal sealed class MfH264Encoder : IDisposable
     /// <summary>Altura da janela capturada, antes do alinhamento.</summary>
     public int SourceHeight => sourceHeight;
     public bool IsHardware { get; }
+    /// <summary>Verdadeiro quando o MFT escolhido processa por eventos (assíncrono).</summary>
+    public bool IsAsync => isAsync;
     public int Bitrate { get; }
 
-    public MfH264Encoder(int width, int height, int fps, int bitrate)
+    public MfH264Encoder(int width, int height, int fps, int bitrate, bool preferHardware = true)
     {
         if (width <= 0 || height <= 0 || fps <= 0 || bitrate <= 0)
         {
@@ -69,13 +112,23 @@ internal sealed class MfH264Encoder : IDisposable
 
         try
         {
-            (transform, Name, IsHardware) = CreateTransform(this.width, this.height, fps, bitrate);
-            Configure(this.transform, this.width, this.height, fps, bitrate);
+            var created = CreateTransform(this.width, this.height, fps, bitrate, preferHardware);
+            transform = created.Transform;
+            Name = created.Name;
+            IsHardware = created.Hardware;
+            isAsync = created.Async;
+
             if (transform.GetOutputStreamInfo(0, out MFTOutputStreamInfo info) >= 0)
             {
                 outputStreamFlags = info.Flags;
                 outputBufferSize = info.Size;
             }
+
+            // A thread de eventos precisa existir antes do StartOfStream: o MFT
+            // só envia NeedInput a partir daí, mas nada garante que ele espere
+            // a primeira chamada de Encode para enfileirar o evento.
+            if (isAsync) StartEventPump();
+
             transform.ProcessMessage(MFTMessageType.NotifyBeginStreaming, IntPtr.Zero);
             int started = transform.ProcessMessage(MFTMessageType.NotifyStartOfStream, IntPtr.Zero);
             if (started < 0) throw new InvalidOperationException("StartOfStream falhou: 0x" + started.ToString("X8"));
@@ -85,24 +138,47 @@ internal sealed class MfH264Encoder : IDisposable
         {
             // Sem este balanço, uma tentativa falha deixa o MF iniciado e um
             // MFT pendurado a cada resize da janela.
-            if (transform is not null)
+            bool pumpStopped = StopEventPump();
+            if (transform is not null && pumpStopped)
             {
                 try { Marshal.ReleaseComObject(transform); } catch { }
                 transform = null;
             }
-            try { MFShutdown(); } catch { }
+            if (pumpStopped)
+            {
+                try { MFShutdown(); } catch { }
+            }
             throw;
         }
     }
 
     /// <summary>Codifica um quadro BGRA. Devolve zero ou mais access units Annex-B.</summary>
     public List<EncodedAccessUnit> Encode(ReadOnlySpan<byte> bgra, int stride, long ptsMs)
+        => Encode(bgra.ToArray(), stride, ptsMs);
+
+    /// <summary>
+    /// Codifica um quadro BGRA sem copiar o array de origem: quando o chamador
+    /// já passa byte[] (caminho de pixels crus), evita alocar e copiar ~8 MB
+    /// por quadro. O array não é retido além desta chamada.
+    /// </summary>
+    public List<EncodedAccessUnit> Encode(byte[] bgra, int stride, long ptsMs)
     {
         lock (gate)
         {
             ObjectDisposedException.ThrowIf(disposed, this);
 
-            byte[] nv12 = BgraToNv12(bgra, stride, sourceWidth, sourceHeight, width, height);
+            // Assíncrono: recolhe saídas já prontas antes de esperar por mais
+            // entrada. Isso evita que um HaveOutput pendente (e a consequente
+            // espera do MFT por ProcessOutput) bloqueie o NeedInput seguinte.
+            var collected = isAsync ? new List<EncodedAccessUnit>() : null;
+            if (collected is not null) DrainAsyncOutputs(collected, 0);
+
+            // Destino com folga para stride: 16 bytes por linha acima de 1088p.
+            int nv12Size = width * height * 3 / 2;
+            byte[] nv12 = nv12Buffer is { } cached && cached.Length >= nv12Size
+                ? cached
+                : nv12Buffer = new byte[nv12Size];
+            BgraToNv12(bgra, stride, sourceWidth, sourceHeight, width, height, nv12);
             IMFMediaBuffer buffer = CreateBuffer(nv12.Length);
             try
             {
@@ -116,20 +192,38 @@ internal sealed class MfH264Encoder : IDisposable
                 try
                 {
                     var sample = new MfSample(samplePointer);
-                    IntPtr bufferUnknown = Marshal.GetIUnknownForObject(buffer);
+                    IntPtr bufferUnknown = Marshal.GetComInterfaceForObject(buffer, typeof(IMFMediaBuffer));
                     try { sample.AddBuffer(bufferUnknown); }
                     finally { Marshal.Release(bufferUnknown); }
                     sample.SetSampleTime(ptsMs * 10_000);
                     sample.SetSampleDuration(10_000_000L / fps);
-                    int hr = transform!.ProcessInput(0, samplePointer, 0);
-                    if (hr < 0) throw new InvalidOperationException("ProcessInput falhou: 0x" + hr.ToString("X8"));
+                    if (isAsync)
+                    {
+                        SubmitInputAsync(samplePointer, collected!);
+                    }
+                    else
+                    {
+                        int hr = transform!.ProcessInput(0, samplePointer, 0);
+                        if (hr < 0) throw new InvalidOperationException(DescribeHResult("ProcessInput falhou", hr));
+                    }
                 }
                 finally { Marshal.Release(samplePointer); }
             }
             finally { Marshal.ReleaseComObject(buffer); }
 
             frameIndex++;
-            return DrainOutputs();
+            if (collected is null) return DrainOutputs();
+            // Espera a saída deste quadro: quem chama codifica um quadro por
+            // vez, e uma saída sinalizada depois do prazo ficaria órfã (o
+            // contador persistiria, mas o access unit já teria sido perdido).
+            if (WaitForHaveOutput(OutputEventTimeoutMs))
+            {
+                TakeHaveOutput();
+                DoProcessOneOutput(collected, out bool streamChanged);
+                if (streamChanged) NegotiateOutputType();
+            }
+            DrainAsyncOutputs(collected, 0);
+            return collected;
         }
     }
 
@@ -139,9 +233,68 @@ internal sealed class MfH264Encoder : IDisposable
         lock (gate)
         {
             ObjectDisposedException.ThrowIf(disposed, this);
+
+            if (!isAsync)
+            {
+                Marshal.ThrowExceptionForHR(transform!.ProcessMessage(MFTMessageType.NotifyEndOfStream, IntPtr.Zero));
+                Marshal.ThrowExceptionForHR(transform.ProcessMessage(MFTMessageType.CommandDrain, IntPtr.Zero));
+                return DrainOutputs();
+            }
+
+            var result = new List<EncodedAccessUnit>();
+            ThrowIfPumpFailed();
+            // Saídas já sinalizadas por Encode não podem ser perdidas ao fechar
+            // a entrada: são colhidas antes de EOS/Drain.
+            DrainAsyncOutputs(result, 0);
+
             Marshal.ThrowExceptionForHR(transform!.ProcessMessage(MFTMessageType.NotifyEndOfStream, IntPtr.Zero));
+            // Só aceita DrainComplete gerado depois deste ponto: um evento
+            // atrasado de um drain anterior não pode encerrar este.
+            lock (eventLock)
+            {
+                awaitingDrain = true;
+                drainCompleteSignaled = false;
+            }
             Marshal.ThrowExceptionForHR(transform.ProcessMessage(MFTMessageType.CommandDrain, IntPtr.Zero));
-            return DrainOutputs();
+
+            // Durante o drain o MFT só emite HaveOutput e, por último,
+            // DrainComplete. As duas esperas compartilham o mesmo prazo total.
+            long deadline = Environment.TickCount64 + DrainTimeoutMs;
+            bool drained = false;
+            while (true)
+            {
+                ThrowIfPumpFailed();
+                if (TakeDrainComplete())
+                {
+                    drained = true;
+                    break;
+                }
+                if (TakeHaveOutput())
+                {
+                    DoProcessOneOutput(result, out bool streamChanged);
+                    if (streamChanged) NegotiateOutputType();
+                    continue;
+                }
+
+                int remaining = (int)(deadline - Environment.TickCount64);
+                if (remaining <= 0) break;
+                WaitForDrainProgress(remaining);
+            }
+
+            // Drain completo ainda pode ter HaveOutput na fila em MFTs que
+            // emitem o evento e o status em ordens diferentes.
+            DrainAsyncOutputs(result, 0);
+
+            if (!drained)
+                throw new TimeoutException($"Drain não concluiu em {DrainTimeoutMs} ms.");
+
+            // Deixa o MFT reutilizável: flush limpa estado e StartOfStream
+            // reabre a emissão de NeedInput (docs de MFT assíncrona).
+            ResetEventState();
+            Marshal.ThrowExceptionForHR(transform.ProcessMessage(MFTMessageType.CommandFlush, IntPtr.Zero));
+            int restarted = transform.ProcessMessage(MFTMessageType.NotifyStartOfStream, IntPtr.Zero);
+            if (restarted < 0) throw new InvalidOperationException(DescribeHResult("StartOfStream falhou", restarted));
+            return result;
         }
     }
 
@@ -157,92 +310,438 @@ internal sealed class MfH264Encoder : IDisposable
         }
     }
 
+    /// <summary>Drenagem síncrona: processa até o MFT devolver NEED_MORE_INPUT.</summary>
     private List<EncodedAccessUnit> DrainOutputs()
     {
         var result = new List<EncodedAccessUnit>();
         while (true)
         {
-            // MFTs sem MFT_OUTPUT_STREAM_PROVIDES_SAMPLES exigem que o chamador
-            // forneça o sample de saída; sem isso ProcessOutput devolve E_INVALIDARG.
-            bool providesSamples = (outputStreamFlags & 0x100) != 0;
-            IntPtr providedSample = IntPtr.Zero;
-            IntPtr providedBuffer = IntPtr.Zero;
-            var output = default(MFTOutputDataBuffer);
-            if (!providesSamples)
-            {
-                uint size = Math.Max(outputBufferSize, 1024u * 1024u);
-                if (MFCreateMemoryBuffer(size, out IMFMediaBuffer buffer) >= 0)
-                {
-                    providedBuffer = Marshal.GetIUnknownForObject(buffer);
-                    Marshal.ReleaseComObject(buffer);
-                    providedSample = CreateSample();
-                    var wrapper = new MfSample(providedSample);
-                    wrapper.AddBuffer(providedBuffer);
-                    output.Sample = providedSample;
-                }
-            }
+            bool produced = DoProcessOneOutput(result, out bool streamChanged);
+            if (streamChanged) { NegotiateOutputType(); continue; }
+            if (!produced) break;
+        }
+        return result;
+    }
 
-            int hr;
-            try { hr = transform!.ProcessOutput(0, 1, ref output, out _); }
-            finally { if (output.Events != IntPtr.Zero) Marshal.Release(output.Events); }
-            if (hr == unchecked((int)MF_E_TRANSFORM_NEED_MORE_INPUT))
+    /// <summary>
+    /// Drenagem assíncrona: só chama ProcessOutput quando existe um evento
+    /// HaveOutput pendente (exigência dos MFTs assíncronos). firstWaitMs é o
+    /// prazo para o primeiro evento; os seguintes são colhidos sem espera.
+    /// </summary>
+    private void DrainAsyncOutputs(List<EncodedAccessUnit> result, int firstWaitMs)
+    {
+        int wait = firstWaitMs;
+        while (true)
+        {
+            if (!WaitForHaveOutput(wait)) return;
+            TakeHaveOutput();
+            wait = 0;
+
+            bool produced = DoProcessOneOutput(result, out bool streamChanged);
+            if (streamChanged)
             {
-                if (providedSample != IntPtr.Zero) Marshal.Release(providedSample);
-                if (providedBuffer != IntPtr.Zero) Marshal.Release(providedBuffer);
-                break;
-            }
-            if (hr == unchecked((int)MF_E_TRANSFORM_STREAM_CHANGE))
-            {
-                if (providedSample != IntPtr.Zero) Marshal.Release(providedSample);
-                if (providedBuffer != IntPtr.Zero) Marshal.Release(providedBuffer);
                 NegotiateOutputType();
                 continue;
             }
+            if (!produced)
+            {
+                // Evento obsoleto (ou E_UNEXPECTED): descarta e segue.
+                continue;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Executa um ProcessOutput. Devolve true quando um access unit foi
+    /// produzido; streamChanged sinaliza que o tipo de saída foi renegociado e
+    /// o chamador deve tentar novamente.
+    /// </summary>
+    private bool DoProcessOneOutput(List<EncodedAccessUnit> result, out bool streamChanged)
+    {
+        streamChanged = false;
+
+        // MFTs sem MFT_OUTPUT_STREAM_PROVIDES_SAMPLES exigem que o chamador
+        // forneça o sample de saída; sem isso ProcessOutput devolve E_INVALIDARG.
+        bool providesSamples = (outputStreamFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES) != 0;
+        IntPtr providedSample = IntPtr.Zero;
+        IntPtr providedBuffer = IntPtr.Zero;
+        var output = default(MFTOutputDataBuffer);
+        if (!providesSamples)
+        {
+            uint size = Math.Max(outputBufferSize, 1024u * 1024u);
+            if (MFCreateMemoryBuffer(size, out IMFMediaBuffer buffer) >= 0)
+            {
+                providedBuffer = Marshal.GetComInterfaceForObject(buffer, typeof(IMFMediaBuffer));
+                Marshal.ReleaseComObject(buffer);
+                providedSample = CreateSample();
+                var wrapper = new MfSample(providedSample);
+                wrapper.AddBuffer(providedBuffer);
+                output.Sample = providedSample;
+            }
+        }
+
+        int hr;
+        try { hr = transform!.ProcessOutput(0, 1, ref output, out _); }
+        finally { if (output.Events != IntPtr.Zero) Marshal.Release(output.Events); }
+
+        if (hr == unchecked((int)MF_E_TRANSFORM_STREAM_CHANGE))
+        {
+            ReleaseProvidedOutput(providedSample, providedBuffer);
+            streamChanged = true;
+            return false;
+        }
+
+        // MFT assíncrono devolve E_UNEXPECTED se ProcessOutput for chamado sem
+        // HaveOutput; tratamos como "nada pronto" em vez de derrubar a sessão.
+        if (hr == unchecked((int)MF_E_TRANSFORM_NEED_MORE_INPUT) || (isAsync && hr == E_UNEXPECTED))
+        {
+            ReleaseProvidedOutput(providedSample, providedBuffer);
+            return false;
+        }
+
+        if (hr < 0)
+        {
+            ReleaseProvidedOutput(providedSample, providedBuffer);
+            throw new InvalidOperationException(DescribeHResult("ProcessOutput falhou", hr));
+        }
+
+        if (output.Sample == IntPtr.Zero)
+        {
+            ReleaseProvidedOutput(providedSample, providedBuffer);
+            return false;
+        }
+
+        try
+        {
+            var sample = new MfSample(output.Sample);
+            uint count = sample.BufferCount;
+            if (count == 0) return false;
+            IntPtr bufferPointer = sample.BufferAt(0);
+            if (bufferPointer == IntPtr.Zero) return false;
+            try
+            {
+                var buffer = (IMFMediaBuffer)Marshal.GetObjectForIUnknown(bufferPointer);
+                try
+                {
+                    buffer.Lock(out IntPtr pointer, out _, out uint current);
+                    byte[] data = new byte[current];
+                    Marshal.Copy(pointer, data, 0, (int)current);
+                    buffer.Unlock();
+                    // O atributo de clean point é opcional: a detecção pelo
+                    // NAL IDR garante a marcação de keyframe mesmo sem ele.
+                    bool keyframe = sample.IsKeyframe || ContainsIdr(data);
+                    result.Add(new EncodedAccessUnit(data, keyframe, sample.SampleTime / 10_000));
+                    return true;
+                }
+                finally { Marshal.ReleaseComObject(buffer); }
+            }
+            finally { Marshal.Release(bufferPointer); }
+        }
+        finally
+        {
+            // providedSample é o mesmo output.Sample quando fomos nós que o
+            // criamos; liberar output.Sample cobre as duas origens. Se o MFT
+            // devolveu outro sample, o nosso ainda precisa ser liberado.
+            if (providedSample != IntPtr.Zero && output.Sample != providedSample) Marshal.Release(providedSample);
+            if (output.Sample != IntPtr.Zero) Marshal.Release(output.Sample);
+            if (providedBuffer != IntPtr.Zero) Marshal.Release(providedBuffer);
+        }
+    }
+
+    private static void ReleaseProvidedOutput(IntPtr sample, IntPtr buffer)
+    {
+        if (sample != IntPtr.Zero) Marshal.Release(sample);
+        if (buffer != IntPtr.Zero) Marshal.Release(buffer);
+    }
+
+    private void RefreshOutputStreamInfo()
+    {
+        if (transform!.GetOutputStreamInfo(0, out MFTOutputStreamInfo info) >= 0)
+        {
+            outputStreamFlags = info.Flags;
+            outputBufferSize = info.Size;
+        }
+    }
+
+    /// <summary>
+    /// Envia um sample depois que o MFT pediu entrada. MF_E_NOTACCEPTING é
+    /// tratado como pedido desatualizado e a espera recomeça, sempre com prazo.
+    /// </summary>
+    private void SubmitInputAsync(IntPtr sample, List<EncodedAccessUnit> collected)
+    {
+        long deadline = Environment.TickCount64 + InputEventTimeoutMs;
+        while (true)
+        {
+            DrainAsyncOutputs(collected, 0);
+            int remaining = (int)(deadline - Environment.TickCount64);
+            if (remaining > 0 && !WaitForNeedInput(Math.Min(remaining, 2))) continue;
+            if (remaining <= 0)
+            {
+                ThrowIfPumpFailed();
+                throw new InvalidOperationException(
+                    $"Encoder {Name} sem entrada em {InputEventTimeoutMs} ms após {frameIndex} quadros (saídas pendentes: {haveOutputCount}).");
+            }
+
+            int hr = transform!.ProcessInput(0, sample, 0);
+            if (hr >= 0) return;
+            if (hr == MF_E_NOTACCEPTING)
+            {
+                if (Environment.TickCount64 >= deadline)
+                {
+                    throw new InvalidOperationException("Encoder assíncrono recusou entrada: MF_E_NOTACCEPTING.");
+                }
+                continue;
+            }
+            throw new InvalidOperationException(DescribeHResult("ProcessInput falhou", hr));
+        }
+    }
+
+    private string DescribeHResult(string prefix, int hr)
+    {
+        string text = prefix + ": 0x" + hr.ToString("X8");
+        if (hr == MF_E_TRANSFORM_ASYNC_LOCKED)
+        {
+            text += " (MF_TRANSFORM_ASYNC_UNLOCK não foi aceito antes da configuração)";
+        }
+        return text;
+    }
+
+    // ---- eventos do MFT assíncrono ----
+
+    private void StartEventPump()
+    {
+        if (transform is not IMFMediaEventGenerator generator)
+        {
+            throw new InvalidOperationException("MFT assíncrono não expôs IMFMediaEventGenerator.");
+        }
+
+        eventGenerator = generator;
+        var stop = new ManualResetEventSlim(false);
+        pumpStop = stop;
+        var thread = new Thread(EventPumpLoop)
+        {
+            IsBackground = true,
+            Name = "mf-h264-events",
+        };
+        eventPump = thread;
+        thread.Start(stop);
+    }
+
+    /// <summary>
+    /// Devolve true quando a thread de eventos terminou. Se ela não parar
+    /// dentro do prazo, o chamador não deve liberar o MFT (evita use-after-free).
+    /// </summary>
+    private bool StopEventPump()
+    {
+        var stop = pumpStop;
+        pumpStop = null;
+        var thread = eventPump;
+        eventPump = null;
+        eventGenerator = null;
+        if (stop is null) return true;
+
+        stop.Set();
+        // Shutdown acorda GetEvent(0); evita polling e sua granularidade de timer.
+        if (transform is IMFShutdown shutdown) shutdown.Shutdown();
+        bool stopped = thread is null || !thread.IsAlive || thread.Join(PumpStopTimeoutMs);
+        if (stopped) stop.Dispose();
+        return stopped;
+    }
+
+    private void EventPumpLoop(object? state)
+    {
+        var stop = (ManualResetEventSlim)state!;
+        var generator = eventGenerator;
+        if (generator is null) return;
+
+        while (!stop.IsSet)
+        {
+            int hr;
+            IMFMediaEvent? mediaEvent = null;
+            try
+            {
+                hr = generator.GetEvent(0, out mediaEvent);
+            }
+            catch (Exception ex)
+            {
+                if (!stop.IsSet)
+                {
+                    SetPumpError(ex.HResult != 0 ? ex.HResult : unchecked((int)0x80004005));
+                }
+                return;
+            }
+
             if (hr < 0)
             {
-                if (providedSample != IntPtr.Zero) Marshal.Release(providedSample);
-                if (providedBuffer != IntPtr.Zero) Marshal.Release(providedBuffer);
-                throw new InvalidOperationException("ProcessOutput falhou: 0x" + hr.ToString("X8"));
+                if (!stop.IsSet) SetPumpError(hr);
+                return;
             }
-            if (output.Sample == IntPtr.Zero)
-            {
-                if (providedSample != IntPtr.Zero) Marshal.Release(providedSample);
-                if (providedBuffer != IntPtr.Zero) Marshal.Release(providedBuffer);
-                break;
-            }
+            if (mediaEvent is null) continue;
 
             try
             {
-                var sample = new MfSample(output.Sample);
-                uint count = sample.BufferCount;
-                if (count == 0) continue;
-                IntPtr bufferPointer = sample.BufferAt(0);
-                if (bufferPointer == IntPtr.Zero) continue;
-                try
+                mediaEvent.GetType(out int type);
+                mediaEvent.GetStatus(out int status);
+                switch (type)
                 {
-                    var buffer = (IMFMediaBuffer)Marshal.GetObjectForIUnknown(bufferPointer);
-                    try
-                    {
-                        buffer.Lock(out IntPtr pointer, out _, out uint current);
-                        byte[] data = new byte[current];
-                        Marshal.Copy(pointer, data, 0, (int)current);
-                        buffer.Unlock();
-                        // O atributo de clean point é opcional: a detecção pelo
-                        // NAL IDR garante a marcação de keyframe mesmo sem ele.
-                        bool keyframe = sample.IsKeyframe || ContainsIdr(data);
-                        result.Add(new EncodedAccessUnit(data, keyframe, sample.SampleTime / 10_000));
-                    }
-                    finally { Marshal.ReleaseComObject(buffer); }
+                    case METransformNeedInput:
+                        lock (eventLock)
+                        {
+                            // Contador, não booleano: MFTs podem ter mais de um
+                            // crédito de entrada em aberto.
+                            needInputCount++;
+                            Monitor.PulseAll(eventLock);
+                        }
+                        break;
+                    case METransformHaveOutput:
+                        lock (eventLock)
+                        {
+                            haveOutputCount++;
+                            Monitor.PulseAll(eventLock);
+                        }
+                        break;
+                    case METransformDrainComplete:
+                        lock (eventLock)
+                        {
+                            if (awaitingDrain)
+                            {
+                                drainCompleteSignaled = true;
+                                Monitor.PulseAll(eventLock);
+                            }
+                        }
+                        break;
+                    case METransformMarker:
+                    case METransformInputStreamStateChanged:
+                        // Sem uso no caminho de encode; o stream change real
+                        // chega por MF_E_TRANSFORM_STREAM_CHANGE.
+                        break;
+                    case MEError:
+                        SetPumpError(status != 0 ? status : unchecked((int)0x80004005));
+                        return;
+                    default:
+                        break;
                 }
-                finally { Marshal.Release(bufferPointer); }
+            }
+            catch (Exception ex)
+            {
+                // Exceção na thread de fundo derrubaria o processo; converte em
+                // erro do encoder para o chamador decidir.
+                if (!stop.IsSet)
+                {
+                    SetPumpError(ex.HResult != 0 ? ex.HResult : unchecked((int)0x80004005));
+                }
+                return;
             }
             finally
             {
-                if (output.Sample != IntPtr.Zero) Marshal.Release(output.Sample);
-                if (providedBuffer != IntPtr.Zero) Marshal.Release(providedBuffer);
+                if (mediaEvent is not null) Marshal.ReleaseComObject(mediaEvent);
             }
         }
-        return result;
+    }
+
+    private void SetPumpError(int hr)
+    {
+        lock (eventLock)
+        {
+            pumpError = hr;
+            Monitor.PulseAll(eventLock);
+        }
+    }
+
+    private void ThrowIfPumpFailed()
+    {
+        int error = Volatile.Read(ref pumpError);
+        if (error != 0)
+        {
+            throw new InvalidOperationException("Evento de erro do encoder assíncrono: 0x" + error.ToString("X8"));
+        }
+    }
+
+    private bool WaitForNeedInput(int timeoutMs)
+    {
+        ThrowIfPumpFailed();
+        long deadline = Environment.TickCount64 + Math.Max(0, timeoutMs);
+        lock (eventLock)
+        {
+            while (needInputCount == 0)
+            {
+                ThrowIfPumpFailed();
+                long remaining = deadline - Environment.TickCount64;
+                if (remaining <= 0) return false;
+                Monitor.Wait(eventLock, (int)remaining);
+            }
+            needInputCount--;
+            return true;
+        }
+    }
+
+    private bool WaitForHaveOutput(int timeoutMs)
+    {
+        ThrowIfPumpFailed();
+        if (timeoutMs <= 0)
+        {
+            lock (eventLock) { return haveOutputCount > 0; }
+        }
+
+        long deadline = Environment.TickCount64 + timeoutMs;
+        lock (eventLock)
+        {
+            while (haveOutputCount == 0)
+            {
+                ThrowIfPumpFailed();
+                long remaining = deadline - Environment.TickCount64;
+                if (remaining <= 0) return false;
+                Monitor.Wait(eventLock, (int)remaining);
+            }
+            return true;
+        }
+    }
+
+    /// <summary>Espera até haver HaveOutput ou DrainComplete (usado no drain).</summary>
+    private void WaitForDrainProgress(int timeoutMs)
+    {
+        long deadline = Environment.TickCount64 + Math.Max(0, timeoutMs);
+        lock (eventLock)
+        {
+            while (!drainCompleteSignaled && haveOutputCount == 0)
+            {
+                if (pumpError != 0) return;
+                long remaining = deadline - Environment.TickCount64;
+                if (remaining <= 0) return;
+                Monitor.Wait(eventLock, (int)remaining);
+            }
+        }
+    }
+
+    private bool TakeHaveOutput()
+    {
+        lock (eventLock)
+        {
+            if (haveOutputCount == 0) return false;
+            haveOutputCount--;
+            return true;
+        }
+    }
+
+    private bool TakeDrainComplete()
+    {
+        lock (eventLock)
+        {
+            if (!drainCompleteSignaled) return false;
+            drainCompleteSignaled = false;
+            return true;
+        }
+    }
+
+    private void ResetEventState()
+    {
+        lock (eventLock)
+        {
+            awaitingDrain = false;
+            needInputCount = 0;
+            haveOutputCount = 0;
+            drainCompleteSignaled = false;
+        }
     }
 
     /// <summary>
@@ -277,7 +776,8 @@ internal sealed class MfH264Encoder : IDisposable
     }
 
     private void NegotiateOutputType()
-    {        for (uint index = 0; ; index++)
+    {
+        for (uint index = 0; ; index++)
         {
             int hr = transform!.GetOutputAvailableType(0, index, out IMFMediaType type);
             if (hr < 0) throw new InvalidOperationException("Encoder sem tipo de saída H.264.");
@@ -287,6 +787,8 @@ internal sealed class MfH264Encoder : IDisposable
                 if (!isH264) continue;
                 int set = transform.SetOutputType(0, type, 0);
                 if (set < 0) throw new InvalidOperationException("SetOutputType falhou: 0x" + set.ToString("X8"));
+                // O tamanho do buffer de saída pode mudar junto com o tipo.
+                RefreshOutputStreamInfo();
                 return;
             }
             finally { Marshal.ReleaseComObject(type); }
@@ -428,11 +930,17 @@ internal sealed class MfH264Encoder : IDisposable
         finally { Marshal.FreeHGlobal(pointer); }
     }
 
-    private static (IMFTransform Transform, string Name, bool Hardware) CreateTransform(int width, int height, int fps, int bitrate)
+    private static (IMFTransform Transform, string Name, bool Hardware, bool Async) CreateTransform(int width, int height, int fps, int bitrate, bool preferHardware)
     {
         lastDiagnostic = "";
-        foreach (uint flags in new[] { MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_SYNCMFT })
+        // Hardware (inclui MFTs assíncronos como o da NVIDIA), depois hardware
+        // síncrono e, por último, o encoder de software da Microsoft.
+        foreach (var (flags, hardware) in new[] {
+            (MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_ASYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER, true),
+            (MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER, true),
+            (MFT_ENUM_FLAG_SYNCMFT, false) })
         {
+            if (hardware && !preferHardware) continue;
             var outputType = new MFTRegisterTypeInfo { MajorType = MfGuids.MFMediaType_Video, SubType = MfGuids.MFVideoFormat_H264 };
             int hr = MFTEnumEx(MfGuids.MFT_CATEGORY_VIDEO_ENCODER, flags, IntPtr.Zero, ref outputType, out IntPtr activates, out uint count);
             if (hr < 0 || count == 0) { lastDiagnostic += $" Enumerar 0x{flags:X}: hr=0x{hr:X8} count={count}."; if (activates != IntPtr.Zero) Marshal.FreeCoTaskMem(activates); continue; }
@@ -446,26 +954,29 @@ internal sealed class MfH264Encoder : IDisposable
                     try
                     {
                         string name = ReadName(activate);
+                        // MF_LOW_LATENCY é lido por alguns encoders de hardware
+                        // ainda na ativação; falha aqui é inofensiva.
+                        _ = activate.SetUINT32(ref MfGuids.MF_LOW_LATENCY, 1);
+
                         var iid = typeof(IMFTransform).GUID;
                         int activated = activate.ActivateObject(ref iid, out IntPtr transformPointer);
                         if (activated < 0 || transformPointer == IntPtr.Zero) continue;
                         var transform = (IMFTransform)Marshal.GetObjectForIUnknown(transformPointer);
                         Marshal.Release(transformPointer);
-                        if (TryConfigure(transform, width, height, fps, bitrate, out string error))
+                        if (TryConfigure(transform, width, height, fps, bitrate, out bool async, out string error))
                         {
-                            bool hardware = (flags & MFT_ENUM_FLAG_HARDWARE) != 0;
-                            return (transform, name, hardware);
+                            return (transform, name, hardware, async);
                         }
+                        lastDiagnostic += $" [{name}: {error}]";
                         Marshal.ReleaseComObject(transform);
                     }
                     finally { Marshal.ReleaseComObject(activate); }
-                    _ = 0;
                 }
             }
             finally { Marshal.FreeCoTaskMem(activates); }
         }
 
-        throw new InvalidOperationException("Nenhum encoder H.264 disponível.");
+        throw new InvalidOperationException("Nenhum encoder H.264 disponível." + lastDiagnostic);
     }
 
     /// <summary>Lista os encoders H.264 registrados (hardware e software).</summary>
@@ -473,7 +984,8 @@ internal sealed class MfH264Encoder : IDisposable
     {
         var lines = new List<string>();
         foreach (var (flags, label) in new[] {
-            (MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER, "hardware"),
+            (MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_ASYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER, "hardware"),
+            (MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER, "hardware-sync"),
             (MFT_ENUM_FLAG_SYNCMFT, "software") })
         {
             var outputType = new MFTRegisterTypeInfo { MajorType = MfGuids.MFMediaType_Video, SubType = MfGuids.MFVideoFormat_H264 };
@@ -501,11 +1013,32 @@ internal sealed class MfH264Encoder : IDisposable
         return lines;
     }
 
-    /// <summary>Testa se o encoder aceita NV12 na resolução pedida.</summary>
-    private static bool TryConfigure(IMFTransform transform, int width, int height, int fps, int bitrate, out string error)
+    /// <summary>
+    /// Desbloqueia e testa o encoder. MF_TRANSFORM_ASYNC_UNLOCK precisa ser
+    /// gravado no attribute store do MFT ativado antes de SetOutputType,
+    /// SetInputType e ProcessMessage, senão todo método devolve
+    /// MF_E_TRANSFORM_ASYNC_LOCKED (documentado em "Asynchronous MFTs").
+    /// </summary>
+    private static bool TryConfigure(IMFTransform transform, int width, int height, int fps, int bitrate, out bool async, out string error)
     {
+        async = false;
         try
         {
+            async = ReadAsyncFlag(transform);
+            if (async)
+            {
+                if (!UnlockAsync(transform))
+                {
+                    throw new InvalidOperationException("MFT assíncrono recusou MF_TRANSFORM_ASYNC_UNLOCK.");
+                }
+                // Sem o gerador de eventos não há como dirigir o MFT pelo modelo
+                // assíncrono; rejeita agora para tentar o próximo da lista.
+                if (transform is not IMFMediaEventGenerator)
+                {
+                    throw new InvalidOperationException("MFT assíncrono não expõe IMFMediaEventGenerator.");
+                }
+            }
+
             Configure(transform, width, height, fps, bitrate);
             error = "";
             return true;
@@ -513,9 +1046,42 @@ internal sealed class MfH264Encoder : IDisposable
         catch (Exception ex)
         {
             error = ex.Message;
-            lastDiagnostic += " [" + ex.Message + "]";
             return false;
         }
+    }
+
+    /// <summary>Lê MF_TRANSFORM_ASYNC do MFT; o gerador de eventos é o sinal de reserva.</summary>
+    private static bool ReadAsyncFlag(IMFTransform transform)
+    {
+        try
+        {
+            if (transform.GetAttributes(out IMFAttributes attributes) >= 0 && attributes is not null)
+            {
+                try
+                {
+                    if (attributes.GetUINT32(ref MfGuids.MF_TRANSFORM_ASYNC, out uint value) >= 0) return value != 0;
+                }
+                finally { Marshal.ReleaseComObject(attributes); }
+            }
+        }
+        catch (Exception) { }
+
+        // Síncronos não devem expor IMFMediaEventGenerator; assíncronos devem.
+        return transform is IMFMediaEventGenerator;
+    }
+
+    private static bool UnlockAsync(IMFTransform transform)
+    {
+        try
+        {
+            if (transform.GetAttributes(out IMFAttributes attributes) >= 0 && attributes is not null)
+            {
+                try { return attributes.SetUINT32(ref MfGuids.MF_TRANSFORM_ASYNC_UNLOCK, 1) >= 0; }
+                finally { Marshal.ReleaseComObject(attributes); }
+            }
+        }
+        catch (Exception) { }
+        return false;
     }
 
     private static string ReadName(IMFActivate activate)
@@ -562,6 +1128,39 @@ internal sealed class MfH264Encoder : IDisposable
         int dstWidth,
         int dstHeight)
     {
+        int ySize = dstWidth * dstHeight;
+        byte[] nv12 = new byte[ySize + ySize / 2];
+        BgraToNv12(bgra, stride, sourceWidth, sourceHeight, dstWidth, dstHeight, nv12);
+        return nv12;
+    }
+
+    /// <summary>
+    /// Converte para um NV12 já alocado (reaproveitado entre quadros: a
+    /// conversão é a etapa mais cara do caminho de 60 FPS).
+    /// </summary>
+    internal static void BgraToNv12(
+        ReadOnlySpan<byte> bgra,
+        int stride,
+        int sourceWidth,
+        int sourceHeight,
+        int dstWidth,
+        int dstHeight,
+        byte[] nv12) => BgraToNv12(bgra.ToArray(), stride, sourceWidth, sourceHeight, dstWidth, dstHeight, nv12);
+
+    /// <summary>
+    /// Conversão sobre um array. A cópia é paralela por faixas: `ReadOnlySpan`
+    /// não pode ser capturado por lambda, e criar um array por quadro poria de
+    /// volta o custo que a versão reaproveitada elimina.
+    /// </summary>
+    internal static void BgraToNv12(
+        byte[] bgra,
+        int stride,
+        int sourceWidth,
+        int sourceHeight,
+        int dstWidth,
+        int dstHeight,
+        byte[] nv12)
+    {
         if (stride < sourceWidth * 4) throw new ArgumentException("Stride inválido.", nameof(stride));
         if (dstWidth < sourceWidth || dstHeight < sourceHeight)
         {
@@ -569,50 +1168,65 @@ internal sealed class MfH264Encoder : IDisposable
         }
 
         int ySize = dstWidth * dstHeight;
-        byte[] nv12 = new byte[ySize + ySize / 2];
+        if (nv12.Length < ySize + ySize / 2) throw new ArgumentException("Destino NV12 pequeno.", nameof(nv12));
 
-        for (int row = 0; row < dstHeight; row++)
-        {
-            int sourceRow = Math.Min(row, sourceHeight - 1);
-            ReadOnlySpan<byte> source = bgra.Slice(sourceRow * stride, sourceWidth * 4);
-            int yOffset = row * dstWidth;
-            for (int col = 0; col < dstWidth; col++)
-            {
-                int sourceCol = Math.Min(col, sourceWidth - 1);
-                int at = sourceCol * 4;
-                int b = source[at], g = source[at + 1], r = source[at + 2];
-                // BT.709 limitado, coerente com o que o VideoToolbox espera do NV12 vídeo-range.
-                int y = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
-                nv12[yOffset + col] = (byte)Math.Clamp(y, 16, 235);
-            }
-        }
+        // Linhas são independentes: faixas reduzem a etapa de CPU mais cara do
+        // caminho de 60 FPS (8,8 ms -> ~2,2 ms em 1920x1088). Faixas com número
+        // par de linhas alinham o plano UV, que amostra duas linhas por pixel
+        // cromático.
+        int bands = Math.Max(1, Math.Min(Environment.ProcessorCount, dstHeight / 16));
+        int rowsPerBand = (((dstHeight + bands - 1) / bands) + 1) & ~1;
+        int bandCount = (dstHeight + rowsPerBand - 1) / rowsPerBand;
+        int yPlane = ySize;
 
-        for (int row = 0; row < dstHeight; row += 2)
+        void ConvertBand(int band)
         {
-            int uvRow = row / 2;
-            int uvOffset = ySize + uvRow * dstWidth;
-            for (int col = 0; col < dstWidth; col += 2)
+            int first = band * rowsPerBand;
+            int last = Math.Min(dstHeight, first + rowsPerBand);
+            for (int row = first; row < last; row++)
             {
-                int sumU = 0, sumV = 0;
-                for (int dy = 0; dy < 2; dy++)
+                int sourceRow = Math.Min(row, sourceHeight - 1);
+                int sourceOffset = sourceRow * stride;
+                int yOffset = row * dstWidth;
+                for (int col = 0; col < dstWidth; col++)
                 {
-                    int sampleRow = Math.Min(row + dy, sourceHeight - 1);
-                    ReadOnlySpan<byte> source = bgra.Slice(sampleRow * stride, sourceWidth * 4);
-                    for (int dx = 0; dx < 2; dx++)
-                    {
-                        int sampleCol = Math.Min(col + dx, sourceWidth - 1);
-                        int at = sampleCol * 4;
-                        int b = source[at], g = source[at + 1], r = source[at + 2];
-                        sumU += ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
-                        sumV += ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
-                    }
+                    int at = sourceOffset + Math.Min(col, sourceWidth - 1) * 4;
+                    int b = bgra[at], g = bgra[at + 1], r = bgra[at + 2];
+                    // BT.709 limitado. Amostras 0..255 dão 24..224 para luma:
+                    // nenhum byte válido precisa ser preso, então o clamp sai
+                    // sem ramificação.
+                    int y = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
+                    nv12[yOffset + col] = (byte)y;
                 }
-                nv12[uvOffset + col] = (byte)Math.Clamp(sumU / 4, 16, 240);
-                nv12[uvOffset + col + 1] = (byte)Math.Clamp(sumV / 4, 16, 240);
+            }
+
+            for (int row = first; row < last; row += 2)
+            {
+                int uvOffset = yPlane + (row / 2) * dstWidth;
+                for (int col = 0; col < dstWidth; col += 2)
+                {
+                    int sumU = 0, sumV = 0;
+                    for (int dy = 0; dy < 2; dy++)
+                    {
+                        int sourceOffset = Math.Min(row + dy, sourceHeight - 1) * stride;
+                        for (int dx = 0; dx < 2; dx++)
+                        {
+                            int at = sourceOffset + Math.Min(col + dx, sourceWidth - 1) * 4;
+                            int b = bgra[at], g = bgra[at + 1], r = bgra[at + 2];
+                            sumU += ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
+                            sumV += ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
+                        }
+                    }
+                    nv12[uvOffset + col] = (byte)(sumU / 4);
+                    nv12[uvOffset + col + 1] = (byte)(sumV / 4);
+                }
             }
         }
 
-        return nv12;
+        // Uma faixa só: já estamos na thread do pipeline e o custo do
+        // Parallel.For seria maior que o ganho.
+        if (bandCount == 1) { ConvertBand(0); return; }
+        Parallel.For(0, bandCount, ConvertBand);
     }
 
     public void Dispose()
@@ -621,18 +1235,31 @@ internal sealed class MfH264Encoder : IDisposable
         {
             if (disposed) return;
             disposed = true;
+
+            // A thread de eventos precisa parar antes de qualquer Release: ela
+            // está dentro de IMFMediaEventGenerator::GetEvent.
+            if (transform is not null)
+            {
+                transform.ProcessMessage(MFTMessageType.NotifyEndOfStream, IntPtr.Zero);
+                transform.ProcessMessage(MFTMessageType.NotifyEndStreaming, IntPtr.Zero);
+            }
+            bool pumpStopped = StopEventPump();
             try
             {
-                if (transform is not null)
+                if (transform is not null && pumpStopped)
                 {
-                    transform.ProcessMessage(MFTMessageType.NotifyEndOfStream, IntPtr.Zero);
-                    transform.ProcessMessage(MFTMessageType.NotifyEndStreaming, IntPtr.Zero);
                     Marshal.ReleaseComObject(transform);
                     transform = null;
                 }
             }
             catch (Exception) { }
-            try { MFShutdown(); } catch (Exception) { }
+
+            // Se a thread não parou, o MFT fica para o finalizador do RCW:
+            // liberar agora permitiria acesso a memória já destruída.
+            if (pumpStopped)
+            {
+                try { MFShutdown(); } catch (Exception) { }
+            }
         }
     }
 
@@ -781,6 +1408,67 @@ internal sealed class MfH264Encoder : IDisposable
         [PreserveSig] int GetCurrentLength(out uint length);
         [PreserveSig] int SetCurrentLength(uint length);
         [PreserveSig] int GetMaxLength(out uint length);
+    }
+
+    /// <summary>
+    /// Fila de eventos out-of-band de MFTs assíncronos. A ordem dos métodos é
+    /// a de mfobjects.h; BeginGetEvent/EndGetEvent ficam declarados como
+    /// ponteiros para preservar os slots. GetEvent(0) bloqueia numa thread
+    /// dedicada e IMFShutdown acorda essa espera no encerramento.
+    /// </summary>
+    [ComImport, Guid("97EC2EA4-0E42-4937-97AC-9D6D328824E1"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IMFShutdown
+    {
+        [PreserveSig] int Shutdown();
+        [PreserveSig] int GetShutdownStatus(out int status);
+    }
+
+    [ComImport, Guid("2CD0BD52-BCD5-4B89-B62C-EADC0C031E7D"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IMFMediaEventGenerator
+    {
+        [PreserveSig] int GetEvent(uint flags, out IMFMediaEvent mediaEvent);
+        [PreserveSig] int BeginGetEvent(IntPtr callback, IntPtr state);
+        [PreserveSig] int EndGetEvent(IntPtr result, out IMFMediaEvent mediaEvent);
+        [PreserveSig] int QueueEvent(int type, ref Guid extendedType, int status, IntPtr value);
+    }
+
+    [ComImport, Guid("DF598932-F10C-4E39-BBA2-C308F101DAA3"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IMFMediaEvent // herda IMFAttributes
+    {
+        [PreserveSig] int GetItem(ref Guid key, IntPtr value);
+        [PreserveSig] int GetItemType(ref Guid key, out int type);
+        [PreserveSig] int CompareItem(ref Guid key, IntPtr value, out int result);
+        [PreserveSig] int Compare(IMFAttributes theirs, int matchType, out int result);
+        [PreserveSig] int GetUINT32(ref Guid key, out uint value);
+        [PreserveSig] int GetUINT64(ref Guid key, out ulong value);
+        [PreserveSig] int GetDouble(ref Guid key, out double value);
+        [PreserveSig] int GetGUID(ref Guid key, out Guid value);
+        [PreserveSig] int GetStringLength(ref Guid key, out uint length);
+        [PreserveSig] int GetString(ref Guid key, [Out] char[] value, uint bufferSize, out uint length);
+        [PreserveSig] int GetAllocatedString(ref Guid key, out IntPtr value, out uint length);
+        [PreserveSig] int GetBlobSize(ref Guid key, out uint size);
+        [PreserveSig] int GetBlob(ref Guid key, [Out] byte[] buffer, uint bufferSize, out uint blobSize);
+        [PreserveSig] int GetAllocatedBlob(ref Guid key, out IntPtr buffer, out uint size);
+        [PreserveSig] int GetUnknown(ref Guid key, ref Guid iid, out IntPtr value);
+        [PreserveSig] int SetItem(ref Guid key, IntPtr value);
+        [PreserveSig] int DeleteItem(ref Guid key);
+        [PreserveSig] int DeleteAllItems();
+        [PreserveSig] int SetUINT32(ref Guid key, uint value);
+        [PreserveSig] int SetUINT64(ref Guid key, ulong value);
+        [PreserveSig] int SetDouble(ref Guid key, double value);
+        [PreserveSig] int SetGUID(ref Guid key, ref Guid value);
+        [PreserveSig] int SetString(ref Guid key, string value);
+        [PreserveSig] int SetBlob(ref Guid key, byte[] buffer, uint bufferSize);
+        [PreserveSig] int SetUnknown(ref Guid key, [MarshalAs(UnmanagedType.IUnknown)] object unknown);
+        [PreserveSig] int LockStore();
+        [PreserveSig] int UnlockStore();
+        [PreserveSig] int GetCount(out uint items);
+        [PreserveSig] int GetItemByIndex(uint index, out Guid key, IntPtr value);
+        [PreserveSig] int CopyAllItems(IMFAttributes destination);
+        [PreserveSig] int GetType(out int type);
+        [PreserveSig] int GetExtendedType(out Guid extendedType);
+        [PreserveSig] int GetStatus(out int status);
+        [PreserveSig] int GetValue(IntPtr value);
     }
 
     /// <summary>

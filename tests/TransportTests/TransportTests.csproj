@@ -6,5 +6,7 @@
     <Compile Include="../../windows/WindowProbe/Remote/Auth.cs" Link="Auth.cs" />
     <Compile Include="../../windows/WindowProbe/Remote/MfH264Encoder.cs" Link="MfH264Encoder.cs" />
     <Compile Include="../../windows/WindowProbe/Capture/CaptureResult.cs" Link="CaptureResult.cs" />
+    <Compile Include="../../windows/WindowProbe/Remote/VideoFramePacer.cs" Link="VideoFramePacer.cs" />
+    <Compile Include="../../windows/WindowProbe/Remote/DisplayWakeLock.cs" Link="DisplayWakeLock.cs" />
   </ItemGroup>
 </Project>
