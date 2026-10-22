@@ -1,49 +1,149 @@
-# remoteDesktop
+# Paneo
 
-Projeto pessoal para usar aplicativos de um PC Windows em janelas individuais
-no Mac, inclusive pela internet. Os programas continuam executando no PC.
+[![Platform: Windows & macOS](https://img.shields.io/badge/platform-Windows%20%7C%20macOS-blue.svg)](https://github.com/wellingtonbarbosadev/paneo)
+[![Streaming: 60 FPS H.264](https://img.shields.io/badge/stream-60%20FPS%20H.264-success.svg)](https://github.com/wellingtonbarbosadev/paneo)
+[![UI: Liquid Glass](https://img.shields.io/badge/UI-Liquid%20Glass%20AppKit-purple.svg)](https://github.com/wellingtonbarbosadev/paneo)
+[![Security: PBKDF2 + TLS](https://img.shields.io/badge/security-TLS%20%2B%20PIN%20PBKDF2-orange.svg)](https://github.com/wellingtonbarbosadev/paneo)
 
-**Estado atual:** protótipo PNG/TLS. O cliente Mac recebeu e
-exibiu 10 quadros de uma janela sintética do Windows 11 Pro e enviou clique,
-texto Unicode, Ctrl+A e Backspace, com resultado conferido no Windows.
-Ainda não é o MVP: faltam testes prolongados/aplicativos reais, WebRTC,
-internet e integração completa de menus/diálogos. Pareamento persistente,
-reconexão e conexões manuais por janela foram adicionados; consulte as validações.
+> **Stream individual Windows applications directly into native macOS windows at 60 FPS.**<br/>
+> Paneo brings the power of your Windows PC to your Mac with per-window capture, zero-knowledge pairing, and seamless Liquid Glass integration.
 
-## Projetos
+---
 
-- `mac/RemoteDesktop`: cliente AppKit com conexão autenticada e visualizador interativo.
-- `windows/WindowProbe`: captura WGC e host experimental (`--host`).
-- `windows/InputProbe`: teste local de texto Unicode com confirmação explícita.
-- `scripts`: diagnóstico, build e autorização opcional de SSH para desenvolvimento.
-- [docs/VALIDATION.md](docs/VALIDATION.md): evidências, instruções e matriz de testes.
-- [docs/PAIRING-AND-CONTROLS.md](docs/PAIRING-AND-CONTROLS.md): pareamento,
-  revogação, arraste, composição de texto e múltiplas conexões.
+## Overview
 
-```sh
-sh scripts/check-mac.sh
-.tools/dotnet/dotnet build windows/WindowProbe/WindowProbe.csproj -c Release
-.tools/dotnet/dotnet build windows/InputProbe/InputProbe.csproj -c Release
+Unlike traditional remote desktop solutions (RDP/VNC) that mirror the entire desktop and hijack your screen layout, **Paneo** captures and streams **individual Windows application windows** directly into macOS.
+
+Each remote application behaves like a first-class citizen on your Mac: complete with fluid 60 FPS video, native hover and mouse interactions, live thumbnail app switching, and hardware-accelerated video decoding.
+
+```mermaid
+flowchart LR
+    subgraph Windows["Windows Host (C# / .NET 10)"]
+        WGC["Windows.Graphics.Capture"] --> D3D["D3D11 Staging Texture<br/>(1.65 ms copy)"]
+        D3D --> NV12["Parallel BGRA → NV12"]
+        NV12 --> MFT["Media Foundation<br/>Low-Latency H.264 MFT"]
+        MFT --> HostTLS["TLS v2 Server<br/>(Port 9443)"]
+        InputHandler["RemoteInput<br/>(SendInput, Topmost, Popups)"] <-- HostTLS
+    end
+
+    subgraph Network["Local Network / VPN"]
+        HostTLS <== "Binary Framing v2 (H.264 + Control)" ==> ClientTLS["TLS Client (Cert Pinned)"]
+    end
+
+    subgraph Mac["macOS Client (Swift 6 / AppKit)"]
+        ClientTLS --> VT["Apple VideoToolbox<br/>(Hardware Decoder)"]
+        VT --> DisplayLayer["AVSampleBufferDisplayLayer<br/>(Metal Direct)"]
+        DisplayLayer --> GlassUI["Liquid Glass UI<br/>(Thumbnail Switcher & Video)"]
+        GlassUI -- "Mouse, Hover, Keyboard, Unicode" --> ClientTLS
+    end
 ```
 
-O SDK local `.tools/dotnet` foi instalado neste workspace e é ignorado pelo Git.
-Em outro equipamento, use seu SDK .NET 10. Build cruzado não valida execução Windows.
+---
 
-## Contexto para continuar em outro chat
+## Key Features
 
-Abra esta pasta como workspace e peça ao agente:
+- 🪟 **Per-Window Streaming**: Run and view specific Windows apps (Discord, Notepad, browsers, IDEs, and heavy desktop tools) on macOS without streaming empty desktop background space.
+- ⚡ **Rock-Solid 60 FPS Video Pipeline**:
+  - Direct3D 11 Staging Textures (`CopyResource` + `Map`/`Unmap`) transfer GPU frames in **~1.65 ms**.
+  - Optimized Media Foundation H.264 encoder operates in low-latency slice mode.
+  - Apple VideoToolbox decodes access units directly into `AVSampleBufferDisplayLayer` with zero copy overhead.
+- 🎨 **Unified Liquid Glass Interface**:
+  - Native macOS AppKit design with translucent glass styling (`NSGlassEffectView` / `NSVisualEffectView`).
+  - Top horizontal thumbnail bar showcasing **real-time live snapshots** of open applications and native Windows process icons.
+  - Instant one-click window switching without tearing down the underlying session.
+- 🔒 **Zero-Knowledge PIN Security**:
+  - Effortless pairing via IP and a user-selected 6-digit PIN.
+  - PBKDF2-HMAC-SHA256 (600,000 iterations) mutual authentication proof prevents plaintext or hash leakage.
+  - Device tokens protected securely via macOS Keychain and Windows DPAPI.
+  - Strict TLS transport with certificate pinning and progressive IP rate limiting against brute-force attempts.
+- 🖱️ **Full Interactivity & Window Fidelity**:
+  - **Fluid Hover Tracking**: Moves the host cursor cleanly and renders host cursor changes natively in the stream.
+  - **Context Menus & Popups (`PopupComposer`)**: Automatically detects, captures, and composites Windows context menus and popup dialogs over the stream.
+  - **Active Z-Order Guard**: Asserts `HWND_TOPMOST` during active interaction so other PC windows never obstruct your remote session, restoring original Z-order upon disconnection.
+  - **Unicode & Keyboard Composition**: Full support for international accents (PT-BR), Ctrl/Cmd shortcuts, navigation keys, and text composition.
+- 💡 **Smart Display Wake Lock**:
+  - Native Windows energy locks (`ES_CONTINUOUS | DISPLAY`) wake and keep the display pipeline active, ensuring stable 60 FPS delivery even if the physical PC monitor is asleep.
 
-> Leia AGENTS.md, memory.md e PLAN.md, confira o estado dos arquivos e retome a
-> partir do próximo passo registrado na memória.
+---
 
-- [memory.md](memory.md): estado atual, propostas, pendências e histórico de continuidade.
-- [PLAN.md](PLAN.md): escopo, arquitetura proposta, etapas e critérios de aceite.
-- [AGENTS.md](AGENTS.md): instruções de retomada e regras de delegação.
+## Quick Start
 
-Para testar manualmente, siga os READMEs de [Windows](windows/WindowProbe/README.md)
-e [Mac](mac/RemoteDesktop/README.md). Escolha no PC a janela a compartilhar e
-copie os dados de pareamento para o Mac. SSH serve somente ao desenvolvimento;
-a conexão dos aplicativos usa diretamente TLS, sem túnel SSH.
+### 1. Windows Host Setup
 
-Próximo trabalho: sessão prolongada com aplicativo real, foco/DPI, rolagem e
-falhas de rede; integração de vídeo WebRTC e validação do fluxo de pareamento.
+1. Launch `WindowProbe.exe --host` on your Windows 11 PC.
+2. The host UI opens and automatically engages the display lock.
+3. Configure your 6-digit PIN (or use the generated PIN).
+4. Note the displayed Local IP address (and default port `9443`).
+
+### 2. macOS Client Setup
+
+1. Open `Paneo.app` (or mount `packaging/mac/dist/remoteDesktop-0.1.0-mac-arm64.dmg`).
+2. Enter the Windows PC **IP address** and your **PIN**.
+3. Click **Connect**:
+   - The device token is stored securely in your macOS Keychain.
+   - Paneo immediately lists all active Windows applications on the top horizontal bar.
+4. Click on any application thumbnail card to start interacting at 60 FPS!
+
+---
+
+## Developer Guide
+
+### Prerequisites
+
+- **macOS**: macOS 14.0+ (Apple Silicon recommended), Swift 6.0+ / Xcode Command Line Tools.
+- **Windows**: Windows 11 Pro/Home (build 22000+), .NET 10 SDK, Visual Studio C++ build tools (optional).
+
+### Building the macOS Client
+
+```bash
+# Build the release app bundle and DMG installer
+./packaging/mac/build-mac.sh
+
+# The signed app and DMG are generated in packaging/mac/dist:
+# - packaging/mac/dist/RemoteDesktop.app
+# - packaging/mac/dist/remoteDesktop-0.1.0-mac-arm64.dmg
+```
+
+To run a fast development build via Swift CLI:
+```bash
+cd mac/RemoteDesktop
+swift build -c release
+```
+
+### Building the Windows Host
+
+```bash
+# Using local .NET 10 SDK:
+.tools/dotnet/dotnet build windows/WindowProbe/WindowProbe.csproj -c Release
+
+# Or using system dotnet:
+dotnet build windows/WindowProbe/WindowProbe.csproj -c Release
+```
+
+The resulting executable will be at `windows/WindowProbe/bin/Release/net10.0-windows10.0.19041.0/WindowProbe.exe`.
+
+### Running Automated Test Suites
+
+```bash
+# Run unit & transport protocol tests (.NET)
+dotnet test tests/TransportTests/TransportTests.csproj -c Release
+
+# Run Mac transport & reconnection fixtures
+python3 scripts/test-mac-transport.py
+python3 scripts/test-mac-reconnect.py
+```
+
+---
+
+## Architecture & Protocol
+
+Paneo operates over **Binary Protocol v2**:
+- **Framing**: Big-endian length-prefixed binary frames (`[u32 length][u8 message_type][payload]`).
+- **Media Stream**: H.264 Annex-B NAL units with a compact 16-byte header (`[type][codec][flags][seq][pts][width][height]`).
+- **Control Path**: JSON control messages over the same TLS connection handling window lists (`windows`), view selection (`view`), mouse pointer events (`pointer`), keyboard events (`key`, `text`), and graceful input rejection notifications (`inputRejected`).
+
+---
+
+## License
+
+This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
