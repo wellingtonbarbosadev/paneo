@@ -6,7 +6,8 @@ public sealed record WindowInfo(
     string ProcessName,
     string Title,
     int Width,
-    int Height)
+    int Height,
+    string? IconBase64 = null)
 {
     public string HandleText => $"0x{Handle.ToInt64():X}";
 

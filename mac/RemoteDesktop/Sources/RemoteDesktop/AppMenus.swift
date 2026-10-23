@@ -45,6 +45,27 @@ enum AppMenus {
         editMenu.addItem(item("Selecionar Tudo", #selector(NSText.selectAll(_:)), "a"))
         editItem.submenu = editMenu
 
+        // 3b. Visualizar — lista recolhível, busca rápida e tela cheia
+        let viewItem = NSMenuItem()
+        mainMenu.addItem(viewItem)
+        let viewMenu = NSMenu(title: "Visualizar")
+        let quickSearch = item("Busca Rápida...", #selector(AppDelegate.openQuickSearch(_:)), "k")
+        viewMenu.addItem(quickSearch)
+        viewMenu.addItem(.separator())
+        let cycleNext = item("Próxima Janela Remota", #selector(AppDelegate.cycleNextWindow(_:)), "`")
+        viewMenu.addItem(cycleNext)
+        let cyclePrev = item("Janela Remota Anterior", #selector(AppDelegate.cyclePreviousWindow(_:)), "~")
+        cyclePrev.keyEquivalentModifierMask = [.command, .shift]
+        viewMenu.addItem(cyclePrev)
+        viewMenu.addItem(.separator())
+        let toggleBar = item("Recolher/Mostrar Lista de Apps", #selector(AppDelegate.toggleAppBar(_:)), "b")
+        toggleBar.keyEquivalentModifierMask = [.command, .shift]
+        viewMenu.addItem(toggleBar)
+        let fullScreen = item("Entrar em Tela Cheia", #selector(NSWindow.toggleFullScreen(_:)), "f")
+        fullScreen.keyEquivalentModifierMask = [.command, .control]
+        viewMenu.addItem(fullScreen)
+        viewItem.submenu = viewMenu
+
         // 4. Janela
         let windowItem = NSMenuItem()
         mainMenu.addItem(windowItem)

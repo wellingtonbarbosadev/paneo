@@ -19,6 +19,7 @@ done
 [ -f "$version_file" ] || fail "arquivo VERSION ausente: $version_file"
 [ -f "$plist_template" ] || fail "template ausente: $plist_template"
 [ -d "$package_dir" ] || fail "pacote Swift ausente: $package_dir"
+[ -f "$repo_dir/assets/branding/Paneo.icns" ] || fail "icone Paneo.icns ausente"
 
 version=$(tr -d ' \t\r\n' < "$version_file")
 [ -n "$version" ] || fail "packaging/VERSION vazio"
@@ -40,6 +41,7 @@ rm -rf "$out_dir"
 app_bundle="$out_dir/$app_name.app"
 mkdir -p "$app_bundle/Contents/MacOS" "$app_bundle/Contents/Resources"
 cp "$binary" "$app_bundle/Contents/MacOS/$app_name"
+cp "$repo_dir/assets/branding/Paneo.icns" "$app_bundle/Contents/Resources/Paneo.icns"
 sed -e "s|@VERSION@|$version|g" "$plist_template" > "$app_bundle/Contents/Info.plist"
 plutil -lint "$app_bundle/Contents/Info.plist" >/dev/null || fail "Info.plist invalido"
 

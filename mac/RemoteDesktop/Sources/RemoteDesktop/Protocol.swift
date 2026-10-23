@@ -15,6 +15,7 @@ enum ProtocolV2 {
     static let codecH264: UInt8 = 1
     static let codecJpeg: UInt8 = 2
     static let codecPng: UInt8 = 3
+    static let codecPcm: UInt8 = 4
 
     /// tipo(1) + codec(1) + flags(2) + seq(4) + ptsMs(4) + largura(2) + altura(2).
     static let mediaHeaderBytes = 16
@@ -166,17 +167,102 @@ struct RemoteWindow: Decodable, Identifiable, Sendable {
     let process: String
     let width: Int
     let height: Int
+    let icon: String?
+    /// HMONITOR quando o item representa a tela inteira de um monitor do PC.
+    let monitorId: Int64?
+
+    enum CodingKeys: String, CodingKey {
+        case id, title, process, width, height, icon
+    }
+
+    /// Processo sintético usado nos cards de tela inteira.
+    static let monitorProcess = "Tela inteira"
+    /// Identificador sintético do card "Todos os monitores".
+    static let allMonitorsId = Int64.min
+
+    var isMonitor: Bool { monitorId != nil }
+    var isAllMonitors: Bool { id == Self.allMonitorsId }
+
+    /// Card de tela inteira para um monitor. O id é negativo para nunca colidir
+    /// com o HWND de uma janela.
+    static func monitor(_ monitor: RemoteMonitor) -> RemoteWindow {
+        RemoteWindow(id: -monitor.id,
+                     title: monitor.primary ? "\(monitor.name) (principal)" : monitor.name,
+                     process: monitorProcess,
+                     width: monitor.width, height: monitor.height,
+                     monitorId: monitor.id)
+    }
+
+    static func allMonitors(count: Int) -> RemoteWindow {
+        RemoteWindow(id: allMonitorsId, title: "Todos os monitores", process: monitorProcess,
+                     width: 0, height: 0, monitorId: -1)
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(Int64.self, forKey: .id)
+        title = try container.decode(String.self, forKey: .title)
+        process = try container.decode(String.self, forKey: .process)
+        width = try container.decode(Int.self, forKey: .width)
+        height = try container.decode(Int.self, forKey: .height)
+        icon = try container.decodeIfPresent(String.self, forKey: .icon)
+        monitorId = nil
+    }
+
+    init(id: Int64, title: String, process: String, width: Int, height: Int, icon: String? = nil,
+         monitorId: Int64? = nil) {
+        self.monitorId = monitorId
+        self.id = id
+        self.title = title
+        self.process = process
+        self.width = width
+        self.height = height
+        self.icon = icon
+    }
+
+    /// Indicador visual de novidade/notificação ou arquivo modificado (*).
+    var badge: String? {
+        if title.hasPrefix("*") || title.contains(" *") { return "•" }
+        if let start = title.firstIndex(of: "("), let end = title.firstIndex(of: ")"), start < end {
+            let inner = String(title[title.index(after: start)..<end])
+            if Int(inner) != nil { return inner }
+        }
+        return nil
+    }
+}
+
+/// Aplicativo disponível para lançamento no Windows.
+struct RemoteApp: Decodable, Identifiable, Sendable, Equatable {
+    let id: String
+    let name: String
+    let cmd: String
+    let icon: String?
+}
+
+/// Monitor físico do PC, publicado na lista `windows` para a tela inteira.
+struct RemoteMonitor: Decodable, Identifiable, Sendable, Equatable {
+    let id: Int64
+    let name: String
+    let width: Int
+    let height: Int
+    let x: Int
+    let y: Int
+    let primary: Bool
 }
 
 enum HostMessage {
     case challenge(salt: Data, nonce: Data)
     case ready(role: String, host: String?, deviceToken: Data?)
     case authFailed(message: String, retryAfter: Int)
-    case windows([RemoteWindow])
+    case windows([RemoteWindow], monitors: [RemoteMonitor], apps: [RemoteApp] = [])
     case inputRejected(String)
     case error(String)
     case pong
     case video(codec: String, width: Int, height: Int)
+    /// Posição/tamanho da janela dentro do quadro (muda quando um popup abre).
+    case viewport(x: Int, y: Int, width: Int, height: Int)
+    case clipboard(String)
+    case fileReceived(String)
 
     private struct Wire: Decodable {
         let type: String
@@ -187,11 +273,17 @@ enum HostMessage {
         let salt: String?
         let nonce: String?
         let windows: [RemoteWindow]?
+        let monitors: [RemoteMonitor]?
+        let apps: [RemoteApp]?
         let message: String?
         let retryAfterSeconds: Int?
         let codec: String?
         let width: Int?
         let height: Int?
+        let x: Int?
+        let y: Int?
+        let text: String?
+        let name: String?
     }
 
     static func decode(_ payload: Data) throws -> HostMessage {
@@ -217,7 +309,7 @@ enum HostMessage {
             return .authFailed(message: wire.message ?? "PIN incorreto.",
                                retryAfter: wire.retryAfterSeconds ?? 0)
         case "windows":
-            return .windows(wire.windows ?? [])
+            return .windows(wire.windows ?? [], monitors: wire.monitors ?? [], apps: wire.apps ?? [])
         case "inputRejected":
             return .inputRejected(wire.message ?? "o Windows recusou a entrada")
         case "error":
@@ -227,6 +319,13 @@ enum HostMessage {
         case "video":
             return .video(codec: wire.codec ?? "desconhecido",
                           width: wire.width ?? 0, height: wire.height ?? 0)
+        case "viewport":
+            return .viewport(x: wire.x ?? 0, y: wire.y ?? 0,
+                             width: wire.width ?? 0, height: wire.height ?? 0)
+        case "clipboard":
+            return .clipboard(wire.text ?? "")
+        case "fileReceived":
+            return .fileReceived(wire.name ?? "")
         default:
             throw ProtocolError.unsupported("Mensagem do host não reconhecida.")
         }
@@ -240,6 +339,7 @@ private struct HelloPayload: Encodable {
     let version = ProtocolV2.version
     let role: String
     let windowId: Int64?
+    let monitorId: Int64?
     let clientName: String
 }
 
@@ -294,10 +394,34 @@ private struct PointerPayload: Encodable {
     let button: String
 }
 
+private struct ClipboardPayload: Encodable {
+    let type = "clipboard"
+    let text: String
+}
+
+private struct LaunchPayload: Encodable {
+    let type = "launch"
+    let app: String
+}
+
+private struct QualityPayload: Encodable {
+    let type = "quality"
+    let fps: Int
+    let bitrate: Int
+}
+
+private struct FileChunkPayload: Encodable {
+    let type = "fileChunk"
+    let name: String
+    let data: String
+    let isFirst: Bool
+    let isLast: Bool
+}
+
 enum OutgoingMessage {
 
-    static func hello(role: String, windowId: Int64? = nil, clientName: String = "Mac") -> Data? {
-        encode(HelloPayload(role: role, windowId: windowId, clientName: clientName))
+    static func hello(role: String, windowId: Int64? = nil, monitorId: Int64? = nil, clientName: String = "Mac") -> Data? {
+        encode(HelloPayload(role: role, windowId: windowId, monitorId: monitorId, clientName: clientName))
     }
 
     static func auth(mode: String, proof: Data) -> Data? {
@@ -311,6 +435,16 @@ enum OutgoingMessage {
     static func ping() -> Data? { encode(SimplePayload(type: "ping")) }
 
     static func open(windowId: Int64) -> Data? { encode(OpenPayload(windowId: windowId)) }
+
+    static func clipboard(_ text: String) -> Data? { encode(ClipboardPayload(text: text)) }
+
+    static func launch(app: String) -> Data? { encode(LaunchPayload(app: app)) }
+
+    static func quality(fps: Int, bitrate: Int) -> Data? { encode(QualityPayload(fps: fps, bitrate: bitrate)) }
+
+    static func fileChunk(name: String, data: String, isFirst: Bool, isLast: Bool) -> Data? {
+        encode(FileChunkPayload(name: name, data: data, isFirst: isFirst, isLast: isLast))
+    }
 
     static func click(x: Double, y: Double, button: RemoteMouseButton) -> Data? {
         encode(ClickPayload(x: x, y: y, button: button.rawValue))

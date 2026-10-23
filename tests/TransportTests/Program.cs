@@ -1,9 +1,11 @@
 using System.Buffers.Binary;
+using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Security;
 using System.Net.Sockets;
 using System.Security.Authentication;
 using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using WindowProbe.Remote;
 
@@ -28,6 +30,57 @@ foreach (int intervalMs in (targetFps == 30 ? new[] { 16, 17, 32, 33 } : new[] {
     Check(!pacer.TryAccept(TimeSpan.FromSeconds(20)), "Aceitou rajada no mesmo instante.");
 }
 Console.WriteLine("PASS cadência de 30/60 FPS com jitter e retomada sem rajadas");
+
+// O lançador só aceita os aplicativos da lista segura; comando vazio, caminho
+// arbitrário ou linha de comando composta não chegam ao Process.Start.
+var knownApps = AppLauncher.GetKnownApps();
+Check(knownApps.Count == 7, $"Lista de aplicativos inesperada: {knownApps.Count}.");
+foreach (string id in new[] { "notepad", "calc", "explorer", "mspaint", "powershell", "cmd", "edge" })
+    Check(knownApps.Any(app => app.Id == id), $"Aplicativo ausente na lista: {id}.");
+Check(knownApps.All(app => app.Command.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)),
+    "Aplicativo conhecido sem executável .exe.");
+Check(!AppLauncher.Launch(null) && !AppLauncher.Launch("") && !AppLauncher.Launch("  "),
+    "Lançador aceitou comando vazio.");
+Check(!AppLauncher.Launch("cmd.exe /c calc"), "Lançador aceitou linha de comando composta.");
+Check(!AppLauncher.Launch("../../Windows/System32/calc.exe"), "Lançador aceitou caminho arbitrário.");
+Check(!AppLauncher.Launch("notepad2"), "Lançador aceitou aplicativo desconhecido.");
+Console.WriteLine("PASS lançador restrito à lista segura de aplicativos");
+
+// quality reconfigura a cadência de entrega e limita valores fora da faixa;
+// o encoder é recriado no próximo quadro, sem bloquear a recepção.
+using (var qualityChannel = new RemoteServer.VideoChannel())
+{
+    Check(qualityChannel.TargetFps == RemoteServer.VideoFps
+        && qualityChannel.TargetBitrate == RemoteServer.VideoBitrate,
+        "Qualidade inicial diferente do padrão.");
+    int acceptedAt60 = 0;
+    for (int ms = 0; ms < 1000; ms += 16)
+        if (qualityChannel.ShouldAcceptFrame(TimeSpan.FromMilliseconds(ms))) acceptedAt60++;
+    Check(acceptedAt60 is >= 59 and <= 63, $"Cadência inicial inesperada: {acceptedAt60}.");
+
+    qualityChannel.UpdateFps(30);
+    Check(qualityChannel.TargetFps == 30, "fps não foi atualizado.");
+    int acceptedAt30 = 0;
+    for (int ms = 0; ms < 1000; ms += 16)
+        if (qualityChannel.ShouldAcceptFrame(TimeSpan.FromMilliseconds(ms))) acceptedAt30++;
+    Check(acceptedAt30 is >= 29 and <= 31, $"Cadência de 30 FPS inesperada: {acceptedAt30}.");
+
+    qualityChannel.UpdateBitrate(4_000_000);
+    Check(qualityChannel.TargetBitrate == 4_000_000, "bitrate não foi atualizado.");
+
+    qualityChannel.UpdateFps(0);
+    qualityChannel.UpdateBitrate(-1);
+    Check(qualityChannel.TargetFps == RemoteServer.MinVideoFps
+        && qualityChannel.TargetBitrate == RemoteServer.MinVideoBitrate,
+        "Valores abaixo da faixa não foram limitados.");
+
+    qualityChannel.UpdateFps(10_000);
+    qualityChannel.UpdateBitrate(int.MaxValue);
+    Check(qualityChannel.TargetFps == RemoteServer.MaxVideoFps
+        && qualityChannel.TargetBitrate == RemoteServer.MaxVideoBitrate,
+        "Valores acima da faixa não foram limitados.");
+}
+Console.WriteLine("PASS quality reconfigura pacer/bitrate e limita valores extremos");
 
 // Solicitação e liberação de energia precisam ocorrer na mesma thread, e o
 // monitor precisa ser acordado uma vez, antes de qualquer espera de vídeo.
@@ -85,6 +138,23 @@ var windowList = new WindowDescriptor[]
     new(456, "Outra janela", "calc", 640, 480)
 };
 
+// Clipboard falso controlado pelo teste: o transporte também é validado no Mac,
+// onde não existe user32.dll. A escrita simula a mudança de sequência que o
+// Windows produz ao copiar texto.
+uint clipboardSequence = 1;
+string clipboardText = "";
+string? clipboardWritten = null;
+var clipboard = new WindowsClipboard(
+    sequenceNumber: () => Volatile.Read(ref clipboardSequence),
+    read: () => (true, Volatile.Read(ref clipboardText)),
+    write: value =>
+    {
+        Volatile.Write(ref clipboardWritten, value);
+        Volatile.Write(ref clipboardText, value);
+        Interlocked.Increment(ref clipboardSequence);
+        return true;
+    });
+
 var server = new RemoteServer(
     new IntPtr(1),
     IPAddress.Loopback,
@@ -92,7 +162,8 @@ var server = new RemoteServer(
     credentials,
     certificate: null,
     windowList: () => windowList,
-    enableVideo: false);
+    enableVideo: false,
+    clipboard: clipboard);
 server.Start();
 
 async Task<(TcpClient Tcp, SslStream Tls)> ConnectAsync(RemoteServer target, bool validFingerprint = true)
@@ -404,6 +475,68 @@ try
         }
     }
 
+    // 5b. Lançador de aplicativos: a lista segura acompanha a mensagem windows
+    // e a mensagem launch chega ao lançador nas duas sessões. O lançador é
+    // injetado para o teste não abrir processos reais na máquina de teste.
+    {
+        var launched = new ConcurrentQueue<string>();
+        using var appServer = new RemoteServer(
+            new IntPtr(1),
+            IPAddress.Loopback,
+            0,
+            credentials,
+            certificate: null,
+            windowList: () => windowList,
+            enableVideo: false,
+            clipboard: clipboard,
+            appLauncher: app => { launched.Enqueue(app); return true; });
+        appServer.Start();
+        try
+        {
+            var (tcp, tls, salt, nonce) = await StartHandshakeAsync(appServer, "control");
+            using (tcp)
+            using (tls)
+            {
+                // Servidor isolado: o PIN cria um deviceToken próprio para ele.
+                await SendPinAsync(tls, Pin, salt, nonce);
+                Check((await ReadJsonAsync(tls)).GetProperty("type").GetString() == "ready", "ready ausente.");
+                JsonElement windows = await ReadJsonAsync(tls);
+                Check(windows.GetProperty("type").GetString() == "windows", "windows ausente.");
+                JsonElement apps = windows.GetProperty("apps");
+                Check(apps.GetArrayLength() == 7, "Lista de aplicativos não foi enviada.");
+                JsonElement notepad = apps.EnumerateArray()
+                    .First(app => app.GetProperty("id").GetString() == "notepad");
+                Check(notepad.GetProperty("name").GetString()!.Length > 0, "Nome do aplicativo vazio.");
+                Check(notepad.GetProperty("cmd").GetString() == "notepad.exe", "Comando do aplicativo inesperado.");
+
+                await SendJsonAsync(tls, new { type = "launch", app = "notepad" });
+                for (int i = 0; i < 100 && !launched.Contains("notepad"); i++) await Task.Delay(20, ct);
+                Check(launched.Contains("notepad"), "launch não chegou ao lançador na sessão de controle.");
+
+                await SendJsonAsync(tls, new { type = "ping" });
+                Check((await ReadJsonAsync(tls)).GetProperty("type").GetString() == "pong", "pong ausente após launch.");
+            }
+
+            var (viewTcp, viewTls, viewSalt, viewNonce) = await StartHandshakeAsync(appServer, "view");
+            using (viewTcp)
+            using (viewTls)
+            {
+                await SendPinAsync(viewTls, Pin, viewSalt, viewNonce);
+                Check((await ReadJsonAsync(viewTls)).GetProperty("type").GetString() == "ready",
+                    "ready ausente na sessão de visualização.");
+                await SendJsonAsync(viewTls, new { type = "launch", app = "calc" });
+                for (int i = 0; i < 100 && !launched.Contains("calc"); i++) await Task.Delay(20, ct);
+                Check(launched.Contains("calc"), "launch não chegou ao lançador na sessão de visualização.");
+            }
+
+            Console.WriteLine("PASS launch chega ao lançador e a lista segura vai na mensagem windows");
+        }
+        finally
+        {
+            await appServer.StopAsync();
+        }
+    }
+
     // 6. JSON fragmentado byte a byte.
     {
         var (tcp, tls, salt, nonce) = await StartHandshakeAsync(server, "control", byteByByte: true);
@@ -414,6 +547,242 @@ try
             JsonElement ready = await ReadJsonAsync(tls);
             Check(ready.GetProperty("type").GetString() == "ready", "JSON fragmentado byte a byte não foi aceito.");
             Console.WriteLine("PASS JSON fragmentado byte a byte continua aceito");
+        }
+    }
+
+    // 6b. Clipboard: recebe o texto copiado no Mac e envia mudanças locais do
+    // Windows, sem devolver como eco o texto que acabou de ser aplicado.
+    {
+        var (tcp, tls, _, nonce) = await StartHandshakeAsync(server, "control");
+        using (tcp)
+        using (tls)
+        {
+            await SendDeviceAsync(tls, deviceToken, nonce);
+            Check((await ReadJsonAsync(tls)).GetProperty("type").GetString() == "ready", "ready ausente.");
+            Check((await ReadJsonAsync(tls)).GetProperty("type").GetString() == "windows", "windows ausente.");
+
+            const string FromMac = "Texto copiado no Mac ✓";
+            await SendJsonAsync(tls, new { type = "clipboard", text = FromMac });
+
+            // A escrita é aplicada no ponto de leitura do servidor; aguarda o efeito.
+            for (int i = 0; i < 100 && Volatile.Read(ref clipboardWritten) != FromMac; i++)
+                await Task.Delay(20, ct);
+            Check(Volatile.Read(ref clipboardWritten) == FromMac, "Texto do Mac não foi aplicado ao clipboard.");
+
+            // Mudança local posterior à última recebida vira mensagem para o Mac.
+            const string FromWindows = "Texto copiado no Windows";
+            Volatile.Write(ref clipboardText, FromWindows);
+            Interlocked.Increment(ref clipboardSequence);
+            JsonElement changed = await ReadJsonAsync(tls);
+            Check(changed.GetProperty("type").GetString() == "clipboard", "Host não enviou mensagem clipboard.");
+            Check(changed.GetProperty("text").GetString() == FromWindows, "Texto enviado ao Mac inesperado.");
+
+            // O caminho de leitura continua vivo depois do clipboard.
+            await SendJsonAsync(tls, new { type = "ping" });
+            Check((await ReadJsonAsync(tls)).GetProperty("type").GetString() == "pong", "pong ausente após clipboard.");
+            Console.WriteLine("PASS clipboard recebe texto do Mac e envia mudanças locais");
+        }
+    }
+
+    // 6c. Qualidade adaptativa: fps e bitrate são aceitos na sessão de
+    // visualização, valores ausentes/extremos não encerram o streaming.
+    {
+        var (tcp, tls, _, nonce) = await StartHandshakeAsync(server, "view");
+        using (tcp)
+        using (tls)
+        {
+            await SendDeviceAsync(tls, deviceToken, nonce);
+            Check((await ReadJsonAsync(tls)).GetProperty("type").GetString() == "ready", "ready ausente.");
+
+            await SendJsonAsync(tls, new { type = "quality", fps = 30, bitrate = 4_000_000 });
+            await SendJsonAsync(tls, new { type = "quality", fps = 0, bitrate = -1 });
+            await SendJsonAsync(tls, new { type = "quality" });
+
+            await SendJsonAsync(tls, new { type = "ping" });
+            bool pong = false;
+            for (int i = 0; i < 30 && !pong; i++)
+            {
+                var frame = await ReadRawFrameAsync(tls);
+                if (frame.Kind != ProtocolV2.KindControl) continue;
+                using JsonDocument document = JsonDocument.Parse(frame.Payload);
+                if (document.RootElement.GetProperty("type").GetString() == "pong") pong = true;
+            }
+
+            Check(pong, "pong ausente após quality.");
+            Console.WriteLine("PASS quality ajusta fps/bitrate e não encerra a sessão");
+        }
+    }
+
+    // 6d. Arquivos: fileStart/fileChunk montam o arquivo no destino e o último
+    // bloco confirma com fileReceived. O nome do Mac nunca vira caminho.
+    {
+        string inbox = Path.Combine(
+            Path.GetTempPath(), "remoteDesktop-files-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(inbox);
+        using var fileReceiver = new FileReceiver(() => inbox);
+        using var fileServer = new RemoteServer(
+            new IntPtr(1),
+            IPAddress.Loopback,
+            0,
+            credentials,
+            certificate: null,
+            windowList: () => windowList,
+            enableVideo: false,
+            fileReceiver: fileReceiver);
+        fileServer.Start();
+        try
+        {
+            var (tcp, tls, salt, nonce) = await StartHandshakeAsync(fileServer, "control");
+            using (tcp)
+            using (tls)
+            {
+                await SendPinAsync(tls, Pin, salt, nonce);
+                Check((await ReadJsonAsync(tls)).GetProperty("type").GetString() == "ready", "ready ausente.");
+                Check((await ReadJsonAsync(tls)).GetProperty("type").GetString() == "windows", "windows ausente.");
+
+                const string FromMac = "../../relatorio:final?.txt";
+                byte[] first = Encoding.UTF8.GetBytes("Olá, ");
+                byte[] second = Encoding.UTF8.GetBytes("arquivo remoto ✓");
+
+                await SendJsonAsync(tls, new { type = "fileStart", name = FromMac });
+                await SendJsonAsync(tls, new
+                {
+                    type = "fileChunk",
+                    name = FromMac,
+                    data = Convert.ToBase64String(first),
+                    isFirst = true
+                });
+                await SendJsonAsync(tls, new
+                {
+                    type = "fileChunk",
+                    name = FromMac,
+                    data = Convert.ToBase64String(second),
+                    isLast = true
+                });
+
+                JsonElement received = await ReadJsonAsync(tls);
+                Check(received.GetProperty("type").GetString() == "fileReceived", "fileReceived ausente.");
+                string savedName = received.GetProperty("name").GetString()!;
+                Check(savedName == "relatorio_final_.txt", $"Nome higienizado inesperado: {savedName}.");
+
+                string fullPath = Path.Combine(inbox, savedName);
+                Check(File.Exists(fullPath), "Arquivo não foi salvo em Downloads/customDir.");
+                Check(Encoding.UTF8.GetString(await File.ReadAllBytesAsync(fullPath, ct)) == "Olá, arquivo remoto ✓",
+                    "Conteúdo do arquivo recebido inesperado.");
+
+                // O caminho de leitura continua vivo depois do arquivo.
+                await SendJsonAsync(tls, new { type = "ping" });
+                Check((await ReadJsonAsync(tls)).GetProperty("type").GetString() == "pong", "pong ausente após arquivo.");
+                Console.WriteLine("PASS arquivo em chunks é salvo com nome higienizado e confirmado");
+            }
+        }
+        finally
+        {
+            await fileServer.StopAsync();
+            try { Directory.Delete(inbox, recursive: true); } catch (IOException) { }
+        }
+    }
+
+    // 6e. Áudio PCM: o gerador entrega blocos de 10 ms em 48 kHz/16-bit/estéreo
+    // mesmo sem sessão de áudio; Start/Stop são idempotentes e seguros.
+    {
+        using var audio = new WindowsAudioCapture(usePcmGenerator: true);
+        var blocks = new ConcurrentQueue<(byte[] Pcm, uint PtsMs)>();
+        audio.OnAudioData = (pcm, pts) => blocks.Enqueue((pcm, pts));
+
+        Check(audio.Start(), "Gerador de áudio não iniciou.");
+        Check(audio.Start(), "Start repetido não foi idempotente.");
+        Check(audio.IsCapturing, "Gerador não ficou ativo.");
+
+        for (int i = 0; i < 100 && blocks.Count < 3; i++) await Task.Delay(10, ct);
+
+        audio.Stop();
+        audio.Stop();
+        Check(!audio.IsCapturing, "Stop não encerrou o gerador.");
+        Check(blocks.Count >= 3, $"Poucos blocos de áudio: {blocks.Count}.");
+        Check(blocks.All(block => block.Pcm.Length == WindowsAudioCapture.BlockBytes),
+            "Bloco de áudio com tamanho diferente de 10 ms estéreo.");
+        Check(blocks.Any(block => block.Pcm.Any(value => value != 0)), "PCM gerado está em silêncio.");
+        uint previousPts = 0;
+        foreach ((byte[] _, uint ptsMs) in blocks)
+        {
+            Check(ptsMs >= previousPts, "PTS do áudio não é monotônico.");
+            previousPts = ptsMs;
+        }
+
+        // Fora do Windows não existe sessão WASAPI: a captura fica inerte em
+        // vez de falhar ou inventar áudio.
+        using var inert = new WindowsAudioCapture();
+        if (!OperatingSystem.IsWindows()) Check(!inert.Start(), "Captura sem WASAPI não deveria iniciar fora do Windows.");
+        inert.Stop();
+        Console.WriteLine("PASS áudio PCM em 48 kHz/16-bit/estéreo com Start/Stop seguros");
+    }
+
+    // 6f. A sessão de visualização trata fileStart/fileChunk no mesmo laço que
+    // recebe o vídeo. Roda só no Windows: no Mac o caminho PNG para em
+    // PopupComposer, limitação preexistente e anterior a este escopo.
+    if (!OperatingSystem.IsWindows())
+    {
+        Console.WriteLine("SKIP arquivo na sessão view exige captura real (Windows)");
+    }
+    else
+    {
+        string viewInbox = Path.Combine(
+            Path.GetTempPath(), "remoteDesktop-files-view-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(viewInbox);
+        using var viewReceiver = new FileReceiver(() => viewInbox);
+        using var viewServer = new RemoteServer(
+            new IntPtr(1),
+            IPAddress.Loopback,
+            0,
+            credentials,
+            certificate: null,
+            windowList: () => windowList,
+            enableVideo: false,
+            fileReceiver: viewReceiver);
+        viewServer.Start();
+        try
+        {
+            var (tcp, tls, salt, nonce) = await StartHandshakeAsync(viewServer, "view");
+            using (tcp)
+            using (tls)
+            {
+                await SendPinAsync(tls, Pin, salt, nonce);
+                Check((await ReadJsonAsync(tls)).GetProperty("type").GetString() == "ready",
+                    "ready ausente na sessão view.");
+
+                await SendJsonAsync(tls, new
+                {
+                    type = "fileChunk",
+                    name = "vista.txt",
+                    data = Convert.ToBase64String(Encoding.UTF8.GetBytes("via sessão view")),
+                    isFirst = true,
+                    isLast = true
+                });
+
+                bool confirmed = false;
+                for (int i = 0; i < 60 && !confirmed; i++)
+                {
+                    var frame = await ReadRawFrameAsync(tls);
+                    if (frame.Kind != ProtocolV2.KindControl) continue;
+                    using JsonDocument document = JsonDocument.Parse(frame.Payload);
+                    if (document.RootElement.GetProperty("type").GetString() != "fileReceived") continue;
+
+                    Check(document.RootElement.GetProperty("name").GetString() == "vista.txt",
+                        "Nome do arquivo da sessão view inesperado.");
+                    confirmed = true;
+                }
+
+                Check(confirmed, "fileReceived ausente na sessão de visualização.");
+                Check(File.Exists(Path.Combine(viewInbox, "vista.txt")),
+                    "Arquivo da sessão view não foi salvo.");
+                Console.WriteLine("PASS sessão de visualização também recebe arquivo durante o vídeo");
+            }
+        }
+        finally
+        {
+            await viewServer.StopAsync();
+            try { Directory.Delete(viewInbox, recursive: true); } catch (IOException) { }
         }
     }
 

@@ -114,6 +114,10 @@ final class H264Decoder {
     var onDecoded: ((CGSize) -> Void)?
     /// Chamado quando um frame é entregue à camada de apresentação.
     var onPresented: ((Bool) -> Void)?
+    /// Chamado para atualizar a miniatura com o quadro atual (cadência suave).
+    var onThumbnail: ((CGImage) -> Void)?
+    private var lastThumbnailTime: TimeInterval = 0
+    private var lastImageBuffer: CVImageBuffer?
 
     init() {
         displayLayer.videoGravity = .resizeAspect
@@ -255,6 +259,24 @@ final class H264Decoder {
         }
         displayLayer.enqueue(sample)
         onPresented?(true)
+
+        lastImageBuffer = imageBuffer
+        let now = ProcessInfo.processInfo.systemUptime
+        if now - lastThumbnailTime >= 1.2, let onThumbnail {
+            lastThumbnailTime = now
+            var cgImage: CGImage?
+            if VTCreateCGImageFromCVPixelBuffer(imageBuffer, options: nil, imageOut: &cgImage) == noErr, let cgImage {
+                onThumbnail(cgImage)
+            }
+        }
+    }
+
+    /// Captura um snapshot imediato do último quadro decodificado.
+    func captureSnapshot() -> CGImage? {
+        guard let buffer = lastImageBuffer else { return nil }
+        var cgImage: CGImage?
+        guard VTCreateCGImageFromCVPixelBuffer(buffer, options: nil, imageOut: &cgImage) == noErr else { return nil }
+        return cgImage
     }
 
     /// Descarta o estado de referência (usado quando a janela muda de tamanho).

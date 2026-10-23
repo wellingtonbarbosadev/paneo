@@ -21,6 +21,9 @@ public static class ProtocolV2
     public const byte CodecJpeg = 2;
     public const byte CodecPng = 3;
 
+    /// <summary>Áudio PCM 48 kHz, 16 bits, estéreo (intercalado, little-endian).</summary>
+    public const byte CodecPcm = 4;
+
     /// <summary>tipo(1) + codec(1) + flags(2) + seq(4) + ptsMs(4) + largura(2) + altura(2).</summary>
     public const int MediaHeaderBytes = 16;
 
@@ -164,5 +167,15 @@ public static class FrameReader
     }
 }
 
-/// <summary>Janela visível do PC, enviada ao Mac.</summary>
-public sealed record WindowDescriptor(long Id, string Title, string Process, int Width, int Height);
+/// <summary>
+/// Janela visível do PC, enviada ao Mac. <paramref name="IconBase64"/> é o PNG
+/// do ícone do aplicativo em Base64, ou <c>null</c> quando não foi possível
+/// extraí-lo (o Mac cai no card de fallback).
+/// </summary>
+public sealed record WindowDescriptor(
+    long Id,
+    string Title,
+    string Process,
+    int Width,
+    int Height,
+    string? IconBase64 = null);

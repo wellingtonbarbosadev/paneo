@@ -2,11 +2,17 @@
   <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable><AllowUnsafeBlocks>true</AllowUnsafeBlocks><NoWarn>$(NoWarn);CA1416</NoWarn></PropertyGroup>
   <ItemGroup>
     <Compile Include="../../windows/WindowProbe/Remote/RemoteServer.cs" Link="RemoteServer.cs" />
+    <Compile Include="../../windows/WindowProbe/Remote/AppLauncher.cs" Link="AppLauncher.cs" />
+    <Compile Include="../../windows/WindowProbe/Remote/WindowsClipboard.cs" Link="WindowsClipboard.cs" />
+    <Compile Include="../../windows/WindowProbe/Remote/FileReceiver.cs" Link="FileReceiver.cs" />
+    <Compile Include="../../windows/WindowProbe/Remote/WindowsAudioCapture.cs" Link="WindowsAudioCapture.cs" />
     <Compile Include="../../windows/WindowProbe/Remote/Protocol.cs" Link="Protocol.cs" />
     <Compile Include="../../windows/WindowProbe/Remote/Auth.cs" Link="Auth.cs" />
     <Compile Include="../../windows/WindowProbe/Remote/MfH264Encoder.cs" Link="MfH264Encoder.cs" />
     <Compile Include="../../windows/WindowProbe/Capture/CaptureResult.cs" Link="CaptureResult.cs" />
     <Compile Include="../../windows/WindowProbe/Remote/VideoFramePacer.cs" Link="VideoFramePacer.cs" />
+    <Compile Include="../../windows/WindowProbe/Remote/PopupComposer.cs" Link="PopupComposer.cs" />
+    <Compile Include="../../windows/WindowProbe/Models/MonitorEnumerator.cs" Link="MonitorEnumerator.cs" />
     <Compile Include="../../windows/WindowProbe/Remote/DisplayWakeLock.cs" Link="DisplayWakeLock.cs" />
   </ItemGroup>
 </Project>

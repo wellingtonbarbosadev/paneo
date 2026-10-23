@@ -43,10 +43,16 @@ final class RemoteConnection: @unchecked Sendable {
     private let onFrame: @MainActor @Sendable (Data, Int, Int, UInt32) -> Void
     private let onMedia: @MainActor @Sendable (Data, UInt8, Bool, Int, Int, UInt32) -> Void
     private let onWindows: @MainActor @Sendable ([RemoteWindow]) -> Void
+    private let onMonitors: @MainActor @Sendable ([RemoteMonitor]) -> Void
+    private let onApps: @MainActor @Sendable ([RemoteApp]) -> Void
     private let onDevicePaired: @MainActor @Sendable (Data, String) -> Void
     private let onRoundTrip: @MainActor @Sendable (Double) -> Void
     private let onNotice: @MainActor @Sendable (String) -> Void
     private let onVideo: @MainActor @Sendable (String, Int, Int) -> Void
+    private let onViewport: @MainActor @Sendable (Int, Int, Int, Int) -> Void
+    var onClipboard: (@MainActor @Sendable (String) -> Void)?
+    var onFileReceived: (@MainActor @Sendable (String) -> Void)?
+    var onAudio: (@MainActor @Sendable (Data) -> Void)?
 
     init(onState: @escaping @MainActor @Sendable (String, Bool) -> Void,
          onFrame: @escaping @MainActor @Sendable (Data, Int, Int, UInt32) -> Void,
@@ -55,7 +61,12 @@ final class RemoteConnection: @unchecked Sendable {
          onDevicePaired: @escaping @MainActor @Sendable (Data, String) -> Void,
          onRoundTrip: @escaping @MainActor @Sendable (Double) -> Void,
          onNotice: @escaping @MainActor @Sendable (String) -> Void,
-         onVideo: @escaping @MainActor @Sendable (String, Int, Int) -> Void = { _, _, _ in }) {
+         onVideo: @escaping @MainActor @Sendable (String, Int, Int) -> Void = { _, _, _ in },
+         onViewport: @escaping @MainActor @Sendable (Int, Int, Int, Int) -> Void = { _, _, _, _ in },
+         onMonitors: @escaping @MainActor @Sendable ([RemoteMonitor]) -> Void = { _ in },
+         onApps: @escaping @MainActor @Sendable ([RemoteApp]) -> Void = { _ in }) {
+        self.onApps = onApps
+        self.onMonitors = onMonitors
         self.onState = onState
         self.onFrame = onFrame
         self.onMedia = onMedia
@@ -64,6 +75,7 @@ final class RemoteConnection: @unchecked Sendable {
         self.onRoundTrip = onRoundTrip
         self.onNotice = onNotice
         self.onVideo = onVideo
+        self.onViewport = onViewport
     }
 
     // MARK: - Ciclo de vida
@@ -74,7 +86,8 @@ final class RemoteConnection: @unchecked Sendable {
                  deviceToken: Data?,
                  fingerprint: String?,
                  role: String = "view",
-                 windowId: Int64? = nil) {
+                 windowId: Int64? = nil,
+                 monitorId: Int64? = nil) {
         queue.async { [self] in
             guard !closed, connection == nil else { return }
 
@@ -134,7 +147,7 @@ final class RemoteConnection: @unchecked Sendable {
                 switch state {
                 case .ready:
                     self.lastReceived = Date()
-                    self.enqueue(Self.hello(role: role, windowId: windowId))
+                    self.enqueue(Self.hello(role: role, windowId: windowId, monitorId: monitorId))
                     self.receive()
                 case .failed:
                     // Com fingerprint configurado, a falha de TLS quase sempre
@@ -170,6 +183,56 @@ final class RemoteConnection: @unchecked Sendable {
         }
     }
 
+    /// Envia texto do clipboard local para o host Windows.
+    func sendClipboard(_ text: String) {
+        queue.async { [self] in
+            guard !closed, authenticated else { return }
+            enqueue(OutgoingMessage.clipboard(text))
+        }
+    }
+
+    /// Lança um aplicativo no host Windows.
+    func launchApp(_ app: String) {
+        queue.async { [self] in
+            guard !closed, authenticated else { return }
+            enqueue(OutgoingMessage.launch(app: app))
+        }
+    }
+
+    /// Ajusta cadência e bitrate adaptativos.
+    func sendQuality(fps: Int, bitrate: Int) {
+        queue.async { [self] in
+            guard !closed, authenticated else { return }
+            enqueue(OutgoingMessage.quality(fps: fps, bitrate: bitrate))
+        }
+    }
+
+    /// Envia arquivo arrastado do Finder em pedaços para o host Windows.
+    func sendFile(url: URL) {
+        queue.async { [self] in
+            guard !closed, authenticated else { return }
+            guard let data = try? Data(contentsOf: url) else { return }
+            let fileName = url.lastPathComponent
+            let chunkSize = 4096
+            var offset = 0
+            let total = data.count
+
+            if total == 0 {
+                enqueue(OutgoingMessage.fileChunk(name: fileName, data: "", isFirst: true, isLast: true))
+                return
+            }
+
+            while offset < total {
+                let nextOffset = min(offset + chunkSize, total)
+                let chunk = data.subdata(in: offset..<nextOffset)
+                let isFirst = (offset == 0)
+                let isLast = (nextOffset == total)
+                enqueue(OutgoingMessage.fileChunk(name: fileName, data: chunk.base64EncodedString(), isFirst: isFirst, isLast: isLast))
+                offset = nextOffset
+            }
+        }
+    }
+
     func disconnect() {
         queue.async { [self] in fail("Desconectado.") }
     }
@@ -200,12 +263,13 @@ final class RemoteConnection: @unchecked Sendable {
     /// `{"type":"hello","version":2,"role":"view","windowId":null,...}`.
     /// Montado aqui (e não via `OutgoingMessage.hello`) porque o encode
     /// sintético de `Int64?` omitiria a chave e o contrato exige `null`.
-    private static func hello(role: String, windowId: Int64?) -> Data? {
+    private static func hello(role: String, windowId: Int64?, monitorId: Int64? = nil) -> Data? {
         let payload: [String: Any] = [
             "type": "hello",
             "version": ProtocolV2.version,
             "role": role,
             "windowId": windowId ?? NSNull(),
+            "monitorId": monitorId ?? NSNull(),
             "clientName": "Mac de \(shortHostname)"
         ]
         guard let json = try? JSONSerialization.data(withJSONObject: payload) else { return nil }
@@ -290,6 +354,11 @@ final class RemoteConnection: @unchecked Sendable {
 
         // Mídia: só depois do `ready`; `seq` repetido ou antigo é descartado.
         guard authenticated else { throw ProtocolError.malformed }
+        if frame.codec == ProtocolV2.codecPcm {
+            let payload = frame.payload
+            Task { @MainActor [onAudio] in onAudio?(payload) }
+            return
+        }
         if frame.codec == ProtocolV2.codecPng
             || frame.codec == ProtocolV2.codecH264
             || frame.codec == ProtocolV2.codecJpeg {
@@ -326,9 +395,13 @@ final class RemoteConnection: @unchecked Sendable {
             var text = "\(Self.authFailurePrefix): \(message)"
             if retryAfter > 0 { text += " Aguarde \(retryAfter) s." }
             fail(text)
-        case let .windows(list):
+        case let .windows(list, monitors, apps):
             guard authenticated else { throw ProtocolError.malformed }
-            Task { @MainActor [onWindows] in onWindows(list) }
+            Task { @MainActor [onWindows, onMonitors, onApps] in
+                onMonitors(monitors)
+                onApps(apps)
+                onWindows(list)
+            }
         case let .inputRejected(reason):
             Task { @MainActor [onNotice] in onNotice("Windows recusou a entrada: \(reason)") }
         case let .error(reason):
@@ -348,6 +421,12 @@ final class RemoteConnection: @unchecked Sendable {
             // O host anuncia a geometria antes do primeiro quadro: usar isso
             // para ajustar a janela evita esperar o primeiro quadro chegar.
             Task { @MainActor [onVideo] in onVideo(codec, width, height) }
+        case let .viewport(x, y, width, height):
+            Task { @MainActor [onViewport] in onViewport(x, y, width, height) }
+        case let .clipboard(text):
+            Task { @MainActor [onClipboard] in onClipboard?(text) }
+        case let .fileReceived(name):
+            Task { @MainActor [onFileReceived] in onFileReceived?(name) }
         }
     }
 

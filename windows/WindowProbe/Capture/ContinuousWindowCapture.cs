@@ -80,6 +80,12 @@ public sealed class ContinuousCaptureOptions
     /// callback de entrega. Nulo mantém o caminho do produto.
     /// </summary>
     public Action<TimeSpan, TimeSpan>? Timings { get; init; }
+
+    /// <summary>
+    /// HMONITOR a capturar em tela inteira. Quando diferente de zero, o
+    /// handle de janela é ignorado e não há checagem de visibilidade.
+    /// </summary>
+    public IntPtr MonitorHandle { get; init; }
 }
 
 /// <summary>
@@ -116,7 +122,7 @@ public static class ContinuousWindowCapture
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(onFrame);
-        if (windowHandle == IntPtr.Zero)
+        if (windowHandle == IntPtr.Zero && options?.MonitorHandle is null or 0)
         {
             throw new ArgumentException("Handle de janela inválido (NULL).", nameof(windowHandle));
         }
@@ -159,13 +165,16 @@ public static class ContinuousWindowCapture
             throw new CaptureException("Captura indisponível nesta sessão ou neste dispositivo.");
         }
 
-        if (!NativeMethods.IsWindowVisible(hwnd) || NativeMethods.IsIconic(hwnd))
+        bool monitorMode = options.MonitorHandle != IntPtr.Zero;
+        if (!monitorMode && (!NativeMethods.IsWindowVisible(hwnd) || NativeMethods.IsIconic(hwnd)))
         {
             throw new CaptureException("A janela foi fechada, ocultada ou minimizada. Atualize a lista.");
         }
 
         using var device = CaptureD3DDevice.Create(message => log?.Report(message));
-        var item = GraphicsCaptureInterop.CreateItemForWindow(hwnd);
+        var item = monitorMode
+            ? GraphicsCaptureInterop.CreateItemForMonitor(options.MonitorHandle)
+            : GraphicsCaptureInterop.CreateItemForWindow(hwnd);
 
         try
         {
@@ -231,7 +240,7 @@ public static class ContinuousWindowCapture
                 {
                     token.ThrowIfCancellationRequested();
 
-                    if (NativeMethods.IsIconic(hwnd))
+                    if (!monitorMode && NativeMethods.IsIconic(hwnd))
                     {
                         // Minimizar pausa o envio, mas não derruba a sessão: o
                         // contrato exige que o vídeo volte ao restaurar.
@@ -240,7 +249,7 @@ public static class ContinuousWindowCapture
                         continue;
                     }
 
-                    if (!NativeMethods.IsWindowVisible(hwnd))
+                    if (!monitorMode && !NativeMethods.IsWindowVisible(hwnd))
                     {
                         throw new CaptureException("A janela foi ocultada ou fechada durante a captura contínua.");
                     }

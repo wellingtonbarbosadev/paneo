@@ -29,6 +29,7 @@ internal sealed class RemoteHostWindow : Window
     private readonly Button start = new() { Content = "Iniciar compartilhamento", Margin = new Thickness(0, 8, 0, 8) };
     private readonly ListBox shared = new() { Height = 80 };
     private readonly CheckBox allowHover = new() { Content = "Permitir que o Mac mova o cursor deste PC (hover)", IsChecked = true };
+    private readonly CheckBox startWithWindows = new() { Content = "Iniciar e compartilhar automaticamente ao entrar no Windows" };
     private readonly TextBlock status = new() { Text = "Parado", TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 8, 0, 0) };
     private readonly List<RemoteServer> servers = [];
     /// <summary>
@@ -44,6 +45,8 @@ internal sealed class RemoteHostWindow : Window
     private bool stopping;
     private bool closing;
     private bool ownsMutex;
+    private bool updatingStartup;
+    private bool settingsLoaded;
 
     /// <summary>Serializa as gravações do estado de pareamento.</summary>
     private readonly SemaphoreSlim persistGate = new(1, 1);
@@ -51,7 +54,7 @@ internal sealed class RemoteHostWindow : Window
     /// <summary>Verdadeiro enquanto a revogação está em curso.</summary>
     private volatile bool revoked;
 
-    public RemoteHostWindow()
+    public RemoteHostWindow(bool autoStart = false)
     {
         Title = "RemoteDesktop — compartilhar janela";
         Width = 720;
@@ -127,6 +130,14 @@ internal sealed class RemoteHostWindow : Window
         allowHover.Unchecked += (_, _) => ApplyHoverSetting();
         panel.Children.Add(allowHover);
 
+        startWithWindows.Margin = new Thickness(0, 8, 0, 0);
+        panel.Children.Add(startWithWindows);
+        panel.Children.Add(new TextBlock
+        {
+            Text = "Usa o PIN salvo nesta conta. Funciona após o login; fechar esta janela encerra o host.",
+            TextWrapping = TextWrapping.Wrap
+        });
+
         var revoke = new Button { Content = "Revogar pareamento", Margin = new Thickness(0, 8, 0, 0) };
         revoke.Click += RevokePairing;
         panel.Children.Add(revoke);
@@ -149,6 +160,33 @@ internal sealed class RemoteHostWindow : Window
         }
 
         UpdatePinUi();
+
+        try
+        {
+            HostSettings settings = HostSettings.Load();
+            port.Text = settings.Port.ToString();
+            allowHover.IsChecked = settings.AllowHover;
+            settingsLoaded = true;
+        }
+        catch (Exception)
+        {
+            status.Text = "Não foi possível ler as preferências salvas. Confira a porta e o hover e inicie manualmente para salvá-las novamente.";
+        }
+
+        try { SetStartupChecked(HostStartup.IsEnabled()); }
+        catch (Exception) { status.Text = "Não foi possível consultar a inicialização com o Windows."; }
+        startWithWindows.Checked += ChangeStartup;
+        startWithWindows.Unchecked += ChangeStartup;
+        port.LostKeyboardFocus += (_, _) => PersistSettings();
+
+        if (autoStart)
+        {
+            Loaded += (_, _) =>
+            {
+                if (!settingsLoaded || state is null) return;
+                if (StartSharingCore()) WindowState = WindowState.Minimized;
+            };
+        }
 
         Closing += async (_, e) =>
         {
@@ -222,17 +260,29 @@ internal sealed class RemoteHostWindow : Window
 
     private void StartSharing(object sender, RoutedEventArgs e)
     {
-        if (stopping) return;
+        StartSharingCore();
+    }
+
+    private bool StartSharingCore()
+    {
+        if (stopping) return false;
         if (state?.Credentials is null)
         {
             status.Text = "Defina um PIN antes de iniciar o compartilhamento.";
-            return;
+            return false;
         }
 
         if (!int.TryParse(port.Text, out int number) || number is < 1 or > 65535)
         {
             status.Text = "Informe uma porta válida (1 a 65535).";
-            return;
+            return false;
+        }
+
+        if (!PersistSettings()) return false;
+        if (servers.Any(existing => existing.Port == number))
+        {
+            status.Text = "O compartilhamento já está ativo nesta porta.";
+            return true;
         }
 
         RemoteServer? server = null;
@@ -246,7 +296,8 @@ internal sealed class RemoteHostWindow : Window
                 state.Certificate,
                 () => WindowEnumerator.GetVisibleWindows()
                     .Select(window => new WindowDescriptor(
-                        window.Handle.ToInt64(), window.Title, window.ProcessName, window.Width, window.Height))
+                        window.Handle.ToInt64(), window.Title, window.ProcessName, window.Width, window.Height,
+                        window.IconBase64))
                     .ToArray());
 
             server.Status = value => Dispatcher.BeginInvoke(() =>
@@ -254,10 +305,12 @@ internal sealed class RemoteHostWindow : Window
                 if (!closing) status.Text = value;
             });
             server.CredentialsChanged += OnCredentialsChanged;
+            server.AllowHover = allowHover.IsChecked == true;
             server.Start();
             servers.Add(server);
             shared.Items.Add($"Porta {server.Port}: este PC (janelas escolhidas pelo Mac)");
             status.Text = "Compartilhamento ativo. No Mac, informe o IP e o PIN e escolha a janela.";
+            return true;
         }
         catch (Exception)
         {
@@ -269,6 +322,7 @@ internal sealed class RemoteHostWindow : Window
             }
 
             status.Text = "Não foi possível iniciar. Confira a porta e tente novamente.";
+            return false;
         }
     }
 
@@ -316,6 +370,63 @@ internal sealed class RemoteHostWindow : Window
         foreach (RemoteServer server in servers)
         {
             server.AllowHover = allowHover.IsChecked == true;
+        }
+        if (settingsLoaded) PersistSettings();
+    }
+
+    private bool PersistSettings()
+    {
+        if (!int.TryParse(port.Text, out int number) || number is < 1 or > 65535)
+        {
+            status.Text = "Informe uma porta válida (1 a 65535) para salvar as preferências.";
+            return false;
+        }
+        try
+        {
+            new HostSettings(number, allowHover.IsChecked == true).Save();
+            settingsLoaded = true;
+            return true;
+        }
+        catch (Exception)
+        {
+            status.Text = "Não foi possível salvar as preferências. Confira as permissões desta conta Windows.";
+            return false;
+        }
+    }
+
+    private void SetStartupChecked(bool enabled)
+    {
+        updatingStartup = true;
+        startWithWindows.IsChecked = enabled;
+        updatingStartup = false;
+    }
+
+    private void ChangeStartup(object sender, RoutedEventArgs e)
+    {
+        if (updatingStartup) return;
+        bool enabled = startWithWindows.IsChecked == true;
+        if (enabled && state?.HasPin != true)
+        {
+            SetStartupChecked(false);
+            status.Text = "Defina e salve um PIN antes de habilitar a inicialização automática.";
+            return;
+        }
+        if (enabled && !PersistSettings())
+        {
+            SetStartupChecked(false);
+            return;
+        }
+        try
+        {
+            HostStartup.SetEnabled(enabled);
+            status.Text = enabled
+                ? "Inicialização automática habilitada para o próximo login desta conta Windows."
+                : "Inicialização automática desabilitada.";
+        }
+        catch (Exception)
+        {
+            SetStartupChecked(!enabled);
+            status.Text = "Não foi possível alterar a inicialização com o Windows. Confira as permissões e o local do executável.";
         }
     }
 

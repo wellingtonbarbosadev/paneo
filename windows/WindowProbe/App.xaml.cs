@@ -114,10 +114,37 @@ public partial class App : Application
             }
             return;
         }
-        if (e.Args.Length == 1 && e.Args[0] == "--host")
+        if (e.Args.Length == 2 && e.Args[0] == "--host" &&
+            e.Args[1] is "--enable-startup" or "--disable-startup")
+        {
+            ShutdownMode = ShutdownMode.OnExplicitShutdown;
+            try
+            {
+                bool enabled = e.Args[1] == "--enable-startup";
+                if (enabled)
+                {
+                    var state = Remote.PairingStore.LoadOrCreate();
+                    using (state.Certificate)
+                    {
+                        if (!state.HasPin) throw new InvalidOperationException("Defina um PIN no host antes de habilitar a inicialização.");
+                    }
+                    _ = Remote.HostSettings.Load();
+                }
+                Remote.HostStartup.SetEnabled(enabled);
+                Shutdown(0);
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"Não foi possível configurar a inicialização: {ex.Message}");
+                Shutdown(1);
+            }
+            return;
+        }
+        if ((e.Args.Length == 1 && e.Args[0] == "--host") ||
+            (e.Args.Length == 2 && e.Args[0] == "--host" && e.Args[1] == "--autostart"))
         {
             ShutdownMode = ShutdownMode.OnMainWindowClose;
-            MainWindow = new Remote.RemoteHostWindow();
+            MainWindow = new Remote.RemoteHostWindow(autoStart: e.Args.Length == 2);
             MainWindow.Show();
             return;
         }

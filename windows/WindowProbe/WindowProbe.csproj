@@ -12,6 +12,7 @@
     <LangVersion>latest</LangVersion>
     <RootNamespace>WindowProbe</RootNamespace>
     <AssemblyName>WindowProbe</AssemblyName>
+    <ApplicationIcon>../../assets/branding/paneo.ico</ApplicationIcon>
     <ApplicationManifest>app.manifest</ApplicationManifest>
   </PropertyGroup>
 

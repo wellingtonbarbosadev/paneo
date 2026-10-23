@@ -8,7 +8,7 @@ struct RemoteDesktopApp {
     static func main() {
         let application = NSApplication.shared
         application.setActivationPolicy(.regular)
-        application.applicationIconImage = nil // usa o ícone genérico; sem arte falsa de conectividade
+        // O bundle fornece o ícone Paneo declarado em CFBundleIconFile.
 
         application.mainMenu = AppMenus.makeMainMenu()
 
@@ -51,6 +51,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         windowControllers.append(controller)
         controller.showWindow()
+    }
+
+    /// ⌘⇧B: recolhe ou mostra a lista de apps da janela em foco.
+    @objc func toggleAppBar(_ sender: Any?) {
+        let key = NSApp.keyWindow
+        let controller = windowControllers.first { $0.window === key } ?? windowControllers.first
+        controller?.toggleBarCollapsed()
+    }
+
+    /// ⌘K: abre ou fecha a busca rápida de janelas.
+    @objc func openQuickSearch(_ sender: Any?) {
+        let key = NSApp.keyWindow
+        let controller = windowControllers.first { $0.window === key } ?? windowControllers.first
+        controller?.toggleQuickSearch()
+    }
+
+    /// ⌘`: avança para a próxima janela remota.
+    @objc func cycleNextWindow(_ sender: Any?) {
+        let key = NSApp.keyWindow
+        let controller = windowControllers.first { $0.window === key } ?? windowControllers.first
+        controller?.cycleWindow(forward: true)
+    }
+
+    /// ⌘⇧`: volta para a janela remota anterior.
+    @objc func cyclePreviousWindow(_ sender: Any?) {
+        let key = NSApp.keyWindow
+        let controller = windowControllers.first { $0.window === key } ?? windowControllers.first
+        controller?.cycleWindow(forward: false)
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {

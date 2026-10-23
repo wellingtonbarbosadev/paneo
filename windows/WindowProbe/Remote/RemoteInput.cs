@@ -8,7 +8,8 @@ namespace WindowProbe.Remote;
 internal sealed class RemoteInput : IDisposable
 {
     private readonly IntPtr hwnd;
-    private readonly Process process;
+    private readonly Process? process;
+    private readonly IntPtr monitor;
     private readonly object inputGate = new();
     private readonly bool wasTopmostOriginally;
     private string? heldButton;
@@ -30,6 +31,21 @@ internal sealed class RemoteInput : IDisposable
         ApplyTopmost();
     }
 
+    /// <summary>
+    /// Entrada para tela inteira: sem janela autorizada, sem checagem de
+    /// processo/foco e sem TOPMOST. As coordenadas normalizadas mapeiam o
+    /// monitor inteiro (política decidida pelo usuário: Mac pareado controla).
+    /// </summary>
+    public RemoteInput(IntPtr monitor, bool fullScreen)
+    {
+        _ = fullScreen;
+        this.monitor = monitor;
+        this.hwnd = IntPtr.Zero;
+        this.process = null;
+    }
+
+    private bool MonitorMode => monitor != IntPtr.Zero;
+
     private static Process TargetProcess(IntPtr hwnd)
     {
         GetWindowThreadProcessId(hwnd, out uint pid);
@@ -45,7 +61,7 @@ internal sealed class RemoteInput : IDisposable
             releaseTimer?.Dispose();
             releaseTimer = null;
             RestoreTopmost();
-            process.Dispose();
+            process?.Dispose();
         }
     }
     private void ReleaseButton()
@@ -99,8 +115,42 @@ internal sealed class RemoteInput : IDisposable
         if (hit == hwnd) return true;
         if (GetAncestor(hit, 2) == hwnd) return true; // GA_ROOT
         if (GetAncestor(hit, 3) == hwnd) return true; // GA_ROOTOWNER
-        if (GetWindowThreadProcessId(hit, out uint hitPid) != 0 && hitPid == (uint)process.Id) return true;
+        if (GetWindowThreadProcessId(hit, out uint hitPid) != 0 && hitPid == (uint)process!.Id) return true;
         return false;
+    }
+
+    /// <summary>
+    /// Área mapeada pelas coordenadas normalizadas: o retângulo do último
+    /// quadro enviado (janela + popups) ou, sem popups, os limites da janela.
+    /// </summary>
+    private bool TryGetViewport(out Rect rect)
+    {
+        if (MonitorMode)
+        {
+            if (WindowProbe.Models.MonitorEnumerator.TryDescribe(monitor, out var info))
+            {
+                rect = new Rect { L = info.X, T = info.Y, R = info.X + info.Width, B = info.Y + info.Height };
+                return true;
+            }
+            rect = default;
+            return false;
+        }
+        if (PopupComposer.TryGetViewport(hwnd, out ScreenRect view))
+        {
+            rect = new Rect { L = view.L, T = view.T, R = view.R, B = view.B };
+            return true;
+        }
+        return DwmGetWindowAttribute(hwnd, 9, out rect, Marshal.SizeOf<Rect>()) >= 0;
+    }
+
+    /// <summary>
+    /// Foco na janela autorizada ou em um popup dela (menu de contexto):
+    /// reativar a janela principal fecharia o menu aberto.
+    /// </summary>
+    private bool IsForegroundAllowed()
+    {
+        IntPtr foreground = GetForegroundWindow();
+        return foreground == hwnd || (foreground != IntPtr.Zero && IsAllowedHit(foreground));
     }
 
     // Melhor esforço: alterna para a janela sem lançar exceção se o Windows negar o foco.
@@ -108,7 +158,7 @@ internal sealed class RemoteInput : IDisposable
     {
         // Já em primeiro plano: não repete SetWindowPos/SetForegroundWindow a
         // cada evento contínuo (scroll/tecla/arraste) na mesma janela focada.
-        if (GetForegroundWindow() == hwnd) return;
+        if (IsForegroundAllowed()) return;
         ApplyTopmost();
         SetForegroundWindow(hwnd);
         WaitForForeground(hwnd, 250);
@@ -181,11 +231,11 @@ internal sealed class RemoteInput : IDisposable
 
         double x = command.GetProperty("x").GetDouble(), y = command.GetProperty("y").GetDouble();
         if (!double.IsFinite(x) || !double.IsFinite(y) || x < 0 || x >= 1 || y < 0 || y >= 1) return;
-        if (!IsWindow(hwnd) || !IsWindowVisible(hwnd) || IsIconic(hwnd)) return;
+        if (!MonitorMode && (!IsWindow(hwnd) || !IsWindowVisible(hwnd) || IsIconic(hwnd))) return;
 
-        int boundsResult = DwmGetWindowAttribute(hwnd, 9, out var rect, Marshal.SizeOf<Rect>());
-        if (boundsResult < 0) return;
+        if (!TryGetViewport(out var rect)) return;
         var point = new Point { X = rect.L + (int)(x * (rect.R - rect.L)), Y = rect.T + (int)(y * (rect.B - rect.T)) };
+        if (MonitorMode) { MoveCursor(point.X, point.Y); return; }
         IntPtr hit = WindowFromPoint(point);
         if (!IsAllowedHit(hit))
         {
@@ -239,12 +289,15 @@ internal sealed class RemoteInput : IDisposable
                 ? pressed.GetString() : null;
             if (heldButton is null || movedButton != heldButton) return;
         }
-        GetWindowThreadProcessId(hwnd, out uint currentPid);
-        if (process.HasExited || currentPid != process.Id || !IsWindow(hwnd) || !IsWindowVisible(hwnd) || IsIconic(hwnd))
-            throw new InvalidOperationException("Janela encerrada, oculta ou minimizada.");
-        BringToForeground(hwnd);
+        if (!MonitorMode)
+        {
+            GetWindowThreadProcessId(hwnd, out uint currentPid);
+            if (process!.HasExited || currentPid != process.Id || !IsWindow(hwnd) || !IsWindowVisible(hwnd) || IsIconic(hwnd))
+                throw new InvalidOperationException("Janela encerrada, oculta ou minimizada.");
+            BringToForeground(hwnd);
+        }
         bool activates = type == "click" || type == "pointer" && action == "down";
-        if (!activates && GetForegroundWindow() != hwnd)
+        if (!MonitorMode && !activates && !IsForegroundAllowed())
             throw new InvalidOperationException("Windows recusou o foco da janela autorizada. Clique primeiro na janela visível.");
         List<Input> events = [];
         if (type is "click" or "scroll" or "pointer")
@@ -252,11 +305,10 @@ internal sealed class RemoteInput : IDisposable
             double x = command.GetProperty("x").GetDouble(), y = command.GetProperty("y").GetDouble();
             if (!double.IsFinite(x) || !double.IsFinite(y) || x < 0 || x >= 1 || y < 0 || y >= 1)
                 throw new InvalidOperationException("Coordenadas inválidas.");
-            int boundsResult = DwmGetWindowAttribute(hwnd, 9, out var rect, Marshal.SizeOf<Rect>());
-            if (boundsResult < 0) throw new InvalidOperationException("Não foi possível obter os limites da janela.");
+            if (!TryGetViewport(out var rect)) throw new InvalidOperationException("Não foi possível obter os limites da janela.");
             var point = new Point { X = rect.L + (int)(x * (rect.R - rect.L)), Y = rect.T + (int)(y * (rect.B - rect.T)) };
-            IntPtr hit = WindowFromPoint(point);
-            if (!IsAllowedHit(hit))
+            IntPtr hit = MonitorMode ? hwnd : WindowFromPoint(point);
+            if (!MonitorMode && !IsAllowedHit(hit))
             {
                 ApplyTopmost();
                 BringWindowToTop(hwnd);
@@ -276,7 +328,7 @@ internal sealed class RemoteInput : IDisposable
                     heldButton = button;
                     events.Add(MouseEvent(button == "left" ? 2u : 8u));
                     releaseTimer ??= new Timer(_ => {
-                        lock (inputGate) { if (heldButton is not null && (GetForegroundWindow() != hwnd || !IsWindowVisible(hwnd) || IsIconic(hwnd))) ReleaseButton(); }
+                        lock (inputGate) { if (heldButton is not null && !MonitorMode && (GetForegroundWindow() != hwnd || !IsWindowVisible(hwnd) || IsIconic(hwnd))) ReleaseButton(); }
                     });
                     releaseTimer.Change(100, 100);
                 }
@@ -326,7 +378,7 @@ internal sealed class RemoteInput : IDisposable
         else throw new InvalidOperationException("Comando desconhecido.");
         // Um clique visível na janela autorizada pode ativá-la naturalmente.
         // Texto/teclas nunca são enviados antes de verificar o foco.
-        if (!activates && GetForegroundWindow() != hwnd) throw new InvalidOperationException("O foco mudou; entrada descartada.");
+        if (!MonitorMode && !activates && !IsForegroundAllowed()) throw new InvalidOperationException("O foco mudou; entrada descartada.");
         var inputs = events.ToArray();
         if (SendInput((uint)inputs.Length, inputs, Marshal.SizeOf<Input>()) != inputs.Length)
         {

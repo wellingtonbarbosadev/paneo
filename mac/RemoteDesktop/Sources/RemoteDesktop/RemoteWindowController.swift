@@ -1,7 +1,7 @@
 import AppKit
 
 /// Janela remota: uma janela do Mac mostrando uma janela do PC, com barra
-/// flutuante em vidro para estado, métricas e ações.
+/// de rodapé em vidro para estado, métricas e ações, sem cobrir o vídeo.
 @MainActor
 final class RemoteWindowController: NSObject, NSWindowDelegate {
 
@@ -42,6 +42,7 @@ final class RemoteWindowController: NSObject, NSWindowDelegate {
                           defer: false)
         super.init()
         window.title = target.title.isEmpty ? "RemoteDesktop" : target.title
+        window.collectionBehavior.insert(.fullScreenPrimary)
         window.minSize = NSSize(width: 480, height: 320)
         window.isReleasedWhenClosed = false
         window.delegate = self
@@ -55,11 +56,10 @@ final class RemoteWindowController: NSObject, NSWindowDelegate {
         NSLayoutConstraint.activate([
             videoView.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             videoView.trailingAnchor.constraint(equalTo: content.trailingAnchor),
-            videoView.topAnchor.constraint(equalTo: content.topAnchor),
-            videoView.bottomAnchor.constraint(equalTo: content.bottomAnchor)
+            videoView.topAnchor.constraint(equalTo: content.topAnchor)
         ])
 
-        // Barra flutuante de vidro no rodapé da janela remota.
+        // Rodapé de vidro separado da área de vídeo.
         let bar = Glass.panel(cornerRadius: 16)
         bar.translatesAutoresizingMaskIntoConstraints = false
         content.addSubview(bar)
@@ -85,6 +85,7 @@ final class RemoteWindowController: NSObject, NSWindowDelegate {
         bar.addSubview(row)
 
         NSLayoutConstraint.activate([
+            videoView.bottomAnchor.constraint(equalTo: bar.topAnchor, constant: -8),
             bar.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
             bar.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
             bar.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -16),
@@ -163,8 +164,13 @@ final class RemoteWindowController: NSObject, NSWindowDelegate {
             onNotice: { [weak self] message in
                 guard let self, self.generation == current else { return }
                 self.statusLabel.stringValue = message
+            },
+            onViewport: { [weak self] x, y, width, height in
+                guard let self, self.generation == current else { return }
+                self.videoView.setBaseRect(x: x, y: y, width: width, height: height)
             }
         )
+        videoView.setBaseRect(x: 0, y: 0, width: 0, height: 0)
 
         videoView.decoder.onError = { [weak self] error in
             guard let self, self.generation == current else { return }
@@ -173,11 +179,13 @@ final class RemoteWindowController: NSObject, NSWindowDelegate {
 
         connection = client
         statusLabel.stringValue = "Conectando…"
-        client.connect(host: host, port: port, pin: pin, deviceToken: deviceToken, fingerprint: fingerprint, role: "view", windowId: target.id)
+        client.connect(host: host, port: port, pin: pin, deviceToken: deviceToken, fingerprint: fingerprint, role: "view",
+                       windowId: target.monitorId == nil ? target.id : nil,
+                       monitorId: target.monitorId)
     }
 
     private func scheduleReconnect() {
-        guard wantsConnection, window.isKeyWindow, retryCount < 5 else {
+        guard wantsConnection, retryCount < 5 else {
             wantsConnection = false
             return
         }
@@ -221,14 +229,20 @@ final class RemoteWindowController: NSObject, NSWindowDelegate {
     func windowDidResignKey(_ notification: Notification) {
         // Manter a sessão viva ao trocar de foco, mas liberar botão pressionado.
         videoView.resetInput()
+        videoView.restoreCursor()
+    }
+
+    func windowDidBecomeKey(_ notification: Notification) {
+        videoView.restoreCursor()
     }
 
     func windowWillClose(_ notification: Notification) {
+        videoView.resetInput()
         wantsConnection = false
         retryTask?.cancel()
         connection?.disconnect()
         connection = nil
-        // O cursor do sistema foi escondido sobre a imagem: precisa voltar.
+        // Remove os retângulos de cursor associados à janela encerrada.
         videoView.restoreCursor()
         onClose?()
     }

@@ -10,8 +10,10 @@ using System.Net.Sockets;
 using System.Security.Authentication;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
+using System.Text;
 using System.Text.Json;
 using WindowProbe.Capture;
+using WindowProbe.Models;
 
 namespace WindowProbe.Remote;
 
@@ -45,6 +47,19 @@ internal sealed class RemoteServer : IDisposable
     private long inputsApplied;
     private volatile bool allowHover = true;
 
+    /// <summary>Intervalo de verificação de mudanças do clipboard do Windows.</summary>
+    private const int ClipboardPollMilliseconds = 300;
+    private readonly WindowsClipboard clipboard;
+    /// <summary>Último texto aplicado vindo do Mac, para não devolver eco.</summary>
+    private string? lastRemoteClipboardText;
+
+    /// <summary>Lançador injetável; em produção usa a lista segura do AppLauncher.</summary>
+    private readonly Func<string, bool> launchApp;
+
+    /// <summary>Receptor de arquivos enviados pelo Mac (injetável nos testes).</summary>
+    private readonly FileReceiver fileReceiver;
+    private readonly bool ownsFileReceiver;
+
     /// <summary>SHA-256 do certificado DER, em hexadecimal maiúsculo.</summary>
     public string Fingerprint { get; }
 
@@ -76,12 +91,26 @@ internal sealed class RemoteServer : IDisposable
         HostCredentials credentials,
         X509Certificate2? certificate = null,
         Func<IReadOnlyList<WindowDescriptor>>? windowList = null,
-        bool enableVideo = true)
+        bool enableVideo = true,
+        WindowsClipboard? clipboard = null,
+        Func<string, bool>? appLauncher = null,
+        FileReceiver? fileReceiver = null)
     {
         hwnd = window;
         this.credentials = credentials ?? throw new ArgumentNullException(nameof(credentials));
         this.windowList = windowList;
         this.enableVideo = enableVideo;
+        this.clipboard = clipboard ?? WindowsClipboard.Shared;
+        launchApp = appLauncher ?? AppLauncher.Launch;
+        if (fileReceiver is null)
+        {
+            this.fileReceiver = new FileReceiver();
+            ownsFileReceiver = true;
+        }
+        else
+        {
+            this.fileReceiver = fileReceiver;
+        }
         ArgumentNullException.ThrowIfNull(address);
 
         if (certificate is null)
@@ -210,23 +239,36 @@ internal sealed class RemoteServer : IDisposable
 
         await SendControlAsync(tls, ready, session.Token).ConfigureAwait(false);
 
-        if (handshake.Role == "control")
+        // O clipboard é acompanhado em qualquer sessão autenticada (controle ou
+        // visualização): mudanças locais viram mensagens de controle assíncronas,
+        // serializadas pelo gate de escrita da conexão.
+        using var clipboardStop = CancellationTokenSource.CreateLinkedTokenSource(session.Token);
+        Task clipboardWatch = WatchClipboardAsync(tls, clipboardStop.Token);
+        try
         {
-            Status?.Invoke("Mac autenticado. Lista de janelas disponível.");
-            await RunControlAsync(tls, session).ConfigureAwait(false);
-        }
-        else
-        {
-            Status?.Invoke("Mac autenticado. Compartilhando janela autorizada.");
-            try { await RunViewAsync(tls, session, handshake.WindowId).ConfigureAwait(false); }
-            finally
+            if (handshake.Role == "control")
             {
-                if (lastVideo is not null) VideoTimings = lastVideo.TimingSnapshot();
+                Status?.Invoke("Mac autenticado. Lista de janelas disponível.");
+                await RunControlAsync(tls, session).ConfigureAwait(false);
             }
+            else
+            {
+                Status?.Invoke("Mac autenticado. Compartilhando janela autorizada.");
+                try { await RunViewAsync(tls, session, handshake.WindowId, handshake.MonitorId).ConfigureAwait(false); }
+                finally
+                {
+                    if (lastVideo is not null) VideoTimings = lastVideo.TimingSnapshot();
+                }
+            }
+        }
+        finally
+        {
+            clipboardStop.Cancel();
+            try { await clipboardWatch.ConfigureAwait(false); } catch (Exception) { }
         }
     }
 
-    private sealed record HandshakeResult(string Role, string? DeviceToken, long? WindowId);
+    private sealed record HandshakeResult(string Role, string? DeviceToken, long? WindowId, long? MonitorId = null);
 
     private async Task<HandshakeResult?> PerformHandshakeAsync(
         SslStream tls, TcpClient client, CancellationToken sessionToken)
@@ -243,6 +285,7 @@ internal sealed class RemoteServer : IDisposable
         string role;
         string clientName;
         long? requestedWindow = null;
+        long? requestedMonitor = null;
         using (JsonDocument hello = helloFrame.ParseControl())
         {
             JsonElement root = hello.RootElement;
@@ -281,6 +324,18 @@ internal sealed class RemoteServer : IDisposable
                     return null;
                 }
                 requestedWindow = value;
+            }
+
+            // Tela inteira: `monitorId` é o HMONITOR publicado na lista `windows`.
+            if (root.TryGetProperty("monitorId", out JsonElement monitorId) &&
+                monitorId.ValueKind != JsonValueKind.Null)
+            {
+                if (monitorId.ValueKind != JsonValueKind.Number || !monitorId.TryGetInt64(out long value) || value <= 0)
+                {
+                    await TrySendErrorAsync(tls, "Mensagem inválida.", sessionToken).ConfigureAwait(false);
+                    return null;
+                }
+                requestedMonitor = value;
             }
         }
 
@@ -376,7 +431,7 @@ internal sealed class RemoteServer : IDisposable
         }
 
         // No modo device o token recebido não é reenviado em ready.
-        return new HandshakeResult(role, deviceToken, requestedWindow);
+        return new HandshakeResult(role, deviceToken, requestedWindow, requestedMonitor);
     }
 
     private async Task RunControlAsync(SslStream tls, CancellationTokenSource session)
@@ -417,6 +472,18 @@ internal sealed class RemoteServer : IDisposable
                 case "open":
                     await TrySendErrorAsync(tls, WindowSelectionUnavailable, session.Token).ConfigureAwait(false);
                     return;
+                case "clipboard":
+                    ApplyRemoteClipboard(root);
+                    break;
+                case "fileStart":
+                case "fileChunk":
+                    await HandleFileAsync(tls, root, session.Token).ConfigureAwait(false);
+                    break;
+                case "launch":
+                    // Abrir um aplicativo também é permitido na sessão de
+                    // controle, que é a que lista os apps ao Mac.
+                    LaunchRemoteApp(root);
+                    break;
                 case "click":
                 case "pointer":
                 case "scroll":
@@ -432,7 +499,7 @@ internal sealed class RemoteServer : IDisposable
     }
 
     /// <summary>Estado do pipeline de vídeo de uma sessão de visualização.</summary>
-    private sealed class VideoChannel
+    internal sealed class VideoChannel : IDisposable
     {
         private readonly object gate = new();
         private MfH264Encoder? encoder;
@@ -448,12 +515,59 @@ internal sealed class RemoteServer : IDisposable
         /// <summary>Contador único de sequência da sessão (PNG e H.264).</summary>
         private uint sequence;
 
-        private readonly VideoFramePacer pacer = new(VideoFps);
+        /// <summary>Cadência corrente; o pacer é recriado quando o Mac pede outra.</summary>
+        private readonly object pacerGate = new();
+        private VideoFramePacer pacer = new(VideoFps);
+        private int fps = VideoFps;
+        private int bitrate = VideoBitrate;
+        /// <summary>Pedido de quality: o encoder é recriado no próximo quadro.</summary>
+        private bool reconfigure;
 
 
         public int ConsecutiveEncodeFailures { get; set; }
         public uint NextSequence() => Interlocked.Increment(ref sequence);
-        public bool ShouldAcceptFrame(TimeSpan elapsed) => pacer.TryAccept(elapsed);
+        public bool ShouldAcceptFrame(TimeSpan elapsed)
+        {
+            lock (pacerGate) return pacer.TryAccept(elapsed);
+        }
+
+        /// <summary>Cadência que o encoder e o anúncio `video` usam agora.</summary>
+        public int TargetFps { get { lock (gate) return fps; } }
+
+        /// <summary>Bitrate corrente do encoder.</summary>
+        public int TargetBitrate { get { lock (gate) return bitrate; } }
+
+        /// <summary>
+        /// Reconfigura a cadência. O pacer vale imediatamente e o encoder é
+        /// recriado no próximo quadro, sem bloquear esta thread de recepção.
+        /// </summary>
+        public void UpdateFps(int targetFps)
+        {
+            int value = Math.Clamp(targetFps, MinVideoFps, MaxVideoFps);
+            lock (gate)
+            {
+                if (value == fps) return;
+                fps = value;
+                reconfigure = true;
+            }
+
+            lock (pacerGate) pacer = new VideoFramePacer(value);
+        }
+
+        /// <summary>
+        /// Reconfigura o bitrate. O Media Foundation não aceita mudar o CBR de
+        /// um MFT em streaming, então o encoder é recriado no próximo quadro.
+        /// </summary>
+        public void UpdateBitrate(int targetBitrate)
+        {
+            int value = Math.Clamp(targetBitrate, MinVideoBitrate, MaxVideoBitrate);
+            lock (gate)
+            {
+                if (value == bitrate) return;
+                bitrate = value;
+                reconfigure = true;
+            }
+        }
 
         // ---- diagnóstico de desempenho (só lido pelo host-performance-smoke) ----
 
@@ -526,15 +640,26 @@ internal sealed class RemoteServer : IDisposable
                     Announced = false;
                 }
 
+                // quality: o MFT não permite trocar fps/bitrate em streaming.
+                // A recriação acontece aqui, na thread de encode, para não
+                // descartar o encoder enquanto ele está codificando um quadro.
+                if (reconfigure && encoder is not null)
+                {
+                    encoder.Dispose();
+                    encoder = null;
+                    Announced = false;
+                }
+                reconfigure = false;
+
                 if (encoder is not null) return encoder;
 
                 try
                 {
-                    try { encoder = new MfH264Encoder(newWidth, newHeight, VideoFps, VideoBitrate, preferHardware); }
+                    try { encoder = new MfH264Encoder(newWidth, newHeight, fps, bitrate, preferHardware); }
                     catch when (preferHardware)
                     {
                         preferHardware = false;
-                        encoder = new MfH264Encoder(newWidth, newHeight, VideoFps, VideoBitrate, preferHardware: false);
+                        encoder = new MfH264Encoder(newWidth, newHeight, fps, bitrate, preferHardware: false);
                     }
                     encoder.RequestKeyframe();
                     LastHardware = encoder.IsHardware;
@@ -580,7 +705,11 @@ internal sealed class RemoteServer : IDisposable
     }
 
     internal const int VideoFps = 60;
-    private const int VideoBitrate = 12_000_000;
+    internal const int MinVideoFps = 1;
+    internal const int MaxVideoFps = 120;
+    internal const int VideoBitrate = 12_000_000;
+    internal const int MinVideoBitrate = 100_000;
+    internal const int MaxVideoBitrate = 50_000_000;
 
     /// <summary>Falhas seguidas do encoder de hardware antes de cair para software.</summary>
     private const int HardwareFallbackFailures = 5;
@@ -607,21 +736,39 @@ internal sealed class RemoteServer : IDisposable
         return null;
     }
 
-    private async Task RunViewAsync(SslStream tls, CancellationTokenSource session, long? requestedWindow)
+    private async Task RunViewAsync(
+        SslStream tls, CancellationTokenSource session, long? requestedWindow, long? requestedMonitor = null)
     {
-        IntPtr? target = ResolveWindow(requestedWindow);
-        if (target is null)
+        IntPtr monitorHandle = IntPtr.Zero;
+        IntPtr windowHandle = IntPtr.Zero;
+        if (requestedMonitor is not null)
         {
-            await TrySendErrorAsync(tls, "Janela não encontrada neste PC.", session.Token).ConfigureAwait(false);
-            return;
+            if (!MonitorEnumerator.TryFind(requestedMonitor.Value, out MonitorInfo monitorInfo))
+            {
+                await TrySendErrorAsync(tls, "Monitor não encontrado neste PC.", session.Token).ConfigureAwait(false);
+                return;
+            }
+            monitorHandle = new IntPtr(monitorInfo.Id);
+        }
+        else
+        {
+            IntPtr? target = ResolveWindow(requestedWindow);
+            if (target is null)
+            {
+                await TrySendErrorAsync(tls, "Janela não encontrada neste PC.", session.Token).ConfigureAwait(false);
+                return;
+            }
+            windowHandle = target.Value;
         }
 
-        IntPtr windowHandle = target.Value;
         using var wake = new DisplayWakeLock();
         DisplayAwake = wake.Acquired;
         MonitorWoken = wake.MonitorWoken;
         Status?.Invoke($"Sessão view: tela acordada={wake.Acquired} monitor religado={wake.MonitorWoken}");
-        using var input = new RemoteInput(windowHandle) { AllowHover = allowHover };
+        using var input = monitorHandle != IntPtr.Zero
+            ? new RemoteInput(monitorHandle, fullScreen: true)
+            : new RemoteInput(windowHandle);
+        input.AllowHover = allowHover;
         using var mediaInFlight = new SemaphoreSlim(2, 2);
         var video = new VideoChannel();
         lastVideo = video;
@@ -636,7 +783,7 @@ internal sealed class RemoteServer : IDisposable
                 bool raw = enableVideo && attempt == 0;
                 try
                 {
-                    await RunCaptureAsync(tls, video, raw, mediaInFlight, windowHandle, session).ConfigureAwait(false);
+                    await RunCaptureAsync(tls, video, raw, mediaInFlight, windowHandle, session, monitorHandle).ConfigureAwait(false);
                     return;
                 }
                 catch (VideoEncoderUnavailable)
@@ -676,9 +823,13 @@ internal sealed class RemoteServer : IDisposable
         bool raw,
         SemaphoreSlim mediaInFlight,
         IntPtr windowHandle,
-        CancellationTokenSource session)
+        CancellationTokenSource session,
+        IntPtr monitorHandle = default)
     {
         using var pipelineStop = CancellationTokenSource.CreateLinkedTokenSource(session.Token);
+        // Tela inteira já mostra tudo: não há popups para compor.
+        PopupComposer? popupComposer = monitorHandle == IntPtr.Zero ? new PopupComposer(windowHandle) : null;
+        (int X, int Y, int Width, int Height) lastBase = default;
         var options = new ContinuousCaptureOptions
         {
             FrameTimeout = TimeSpan.FromHours(8),
@@ -689,39 +840,60 @@ internal sealed class RemoteServer : IDisposable
             // O cursor do PC precisa entrar no quadro: o Mac esconde o cursor
             // local sobre a imagem, então sem isso não há ponteiro na tela.
             CaptureCursor = true,
-            RawFrame = raw ? (rawFrame, ct) =>
-                SendVideoFrameAsync(tls, video, rawFrame, mediaInFlight, ct) : null,
-            Timings = raw ? video.Timings : null
+            // Menus de contexto e popups são janelas separadas: o compositor
+            // os desenha sobre o quadro da janela autorizada.
+            RawFrame = raw ? async (rawFrame, ct) =>
+            {
+                RawPixelFrame composed = popupComposer is null ? rawFrame : popupComposer.Compose(rawFrame);
+                // Informa ao Mac onde fica a janela dentro do quadro (muda só
+                // quando um popup abre/fecha) para manter a escala estável.
+                var baseRect = popupComposer?.Base ?? default;
+                if (popupComposer is not null && baseRect != lastBase)
+                {
+                    lastBase = baseRect;
+                    await SendControlAsync(
+                        tls,
+                        new { type = "viewport", x = baseRect.X, y = baseRect.Y, width = baseRect.Width, height = baseRect.Height },
+                        ct).ConfigureAwait(false);
+                }
+                await SendVideoFrameAsync(tls, video, composed, mediaInFlight, ct).ConfigureAwait(false);
+            } : null,
+            Timings = raw ? video.Timings : null,
+            MonitorHandle = monitorHandle
         };
 
-        await ContinuousWindowCapture.RunAsync(
-            windowHandle,
-            async (frame, ct) =>
-            {
-                if (frame.Width is <= 0 or > ushort.MaxValue || frame.Height is <= 0 or > ushort.MaxValue) return;
-
-                byte[] framed = FrameMedia(
-                    ProtocolV2.CodecPng,
-                    keyframe: true,
-                    video.NextSequence(),
-                    (uint)Math.Clamp(frame.Elapsed.TotalMilliseconds, 0d, uint.MaxValue),
-                    (ushort)frame.Width,
-                    (ushort)frame.Height,
-                    frame.Png);
-
-                await mediaInFlight.WaitAsync(ct).ConfigureAwait(false);
-                try
+        try
+        {
+            await ContinuousWindowCapture.RunAsync(
+                windowHandle,
+                async (frame, ct) =>
                 {
-                    await WriteAsync(tls, framed, ct).ConfigureAwait(false);
-                    Interlocked.Increment(ref framesSent);
-                }
-                finally { mediaInFlight.Release(); }
+                    if (frame.Width is <= 0 or > ushort.MaxValue || frame.Height is <= 0 or > ushort.MaxValue) return;
 
-                await Task.Delay(125, ct).ConfigureAwait(false);
-            },
-            options,
-            null,
-            pipelineStop.Token).ConfigureAwait(false);
+                    byte[] framed = FrameMedia(
+                        ProtocolV2.CodecPng,
+                        keyframe: true,
+                        video.NextSequence(),
+                        (uint)Math.Clamp(frame.Elapsed.TotalMilliseconds, 0d, uint.MaxValue),
+                        (ushort)frame.Width,
+                        (ushort)frame.Height,
+                        frame.Png);
+
+                    await mediaInFlight.WaitAsync(ct).ConfigureAwait(false);
+                    try
+                    {
+                        await WriteAsync(tls, framed, ct).ConfigureAwait(false);
+                        Interlocked.Increment(ref framesSent);
+                    }
+                    finally { mediaInFlight.Release(); }
+
+                    await Task.Delay(125, ct).ConfigureAwait(false);
+                },
+                options,
+                null,
+                pipelineStop.Token).ConfigureAwait(false);
+        }
+        finally { popupComposer?.Release(); }
     }
 
     private async Task SendVideoFrameAsync(
@@ -752,7 +924,7 @@ internal sealed class RemoteServer : IDisposable
             video.Announced = true;
             await SendControlAsync(
                 tls,
-                new { type = "video", codec = "h264", width = encodedWidth, height = encodedHeight, fps = VideoFps, hardware = encoder.IsHardware },
+                new { type = "video", codec = "h264", width = encodedWidth, height = encodedHeight, fps = video.TargetFps, hardware = encoder.IsHardware },
                 ct).ConfigureAwait(false);
         }
 
@@ -844,13 +1016,25 @@ internal sealed class RemoteServer : IDisposable
                         // Encerramento limpio pedido pelo cliente.
                         return;
                     case "quality":
+                        ApplyQuality(root, video);
+                        break;
                     case "list":
-                        // Mensagens opcionais: aceitas e ignoradas nesta versão.
-                        // Não podem derrubar a sessão de vídeo.
+                        // Mensagem opcional: aceita e ignorada nesta versão.
+                        // Não pode derrubar a sessão de vídeo.
+                        break;
+                    case "launch":
+                        LaunchRemoteApp(root);
                         break;
                     case "open":
                         await TrySendErrorAsync(tls, WindowSelectionUnavailable, session.Token).ConfigureAwait(false);
                         return;
+                    case "clipboard":
+                        ApplyRemoteClipboard(root);
+                        break;
+                    case "fileStart":
+                    case "fileChunk":
+                        await HandleFileAsync(tls, root, session.Token).ConfigureAwait(false);
+                        break;
                     case "click":
                     case "pointer":
                     case "scroll":
@@ -886,11 +1070,151 @@ internal sealed class RemoteServer : IDisposable
         finally { session.Cancel(); }
     }
 
+    /// <summary>
+    /// Aplica o pedido de qualidade do Mac. Cada campo é opcional; valor
+    /// ausente mantém o atual e valor fora da faixa é limitado, nunca encerra
+    /// a sessão.
+    /// </summary>
+    private static void ApplyQuality(JsonElement root, VideoChannel video)
+    {
+        if (TryGetInt32(root, "fps", out int fps)) video.UpdateFps(fps);
+        if (TryGetInt32(root, "bitrate", out int bitrate)) video.UpdateBitrate(bitrate);
+    }
+
+    /// <summary>
+    /// Abre o aplicativo pedido pelo Mac. O lançador valida a lista segura;
+    /// recusa ou falha do Windows não encerram a sessão.
+    /// </summary>
+    private void LaunchRemoteApp(JsonElement root)
+    {
+        string? app = GetString(root, "app");
+        if (string.IsNullOrWhiteSpace(app) || app.Length > 64) return;
+
+        try
+        {
+            if (!launchApp(app)) Status?.Invoke("Aplicativo remoto não iniciado: " + app);
+        }
+        catch (Exception)
+        {
+            // Falha de inicialização é best-effort, como o clipboard.
+        }
+    }
+
+    /// <summary>
+    /// Aplica o texto vindo do Mac. Falha do clipboard é best-effort: não
+    /// encerra a sessão de vídeo nem muda o contrato do protocolo.
+    /// </summary>
+    private void ApplyRemoteClipboard(JsonElement root)
+    {
+        string? text = GetString(root, "text");
+        if (text is null) return;
+        if (Encoding.UTF8.GetByteCount(text) > WindowsClipboard.MaxTextBytes) return;
+
+        // Marca antes da escrita: a mudança de sequência provocada por ela não
+        // pode voltar ao Mac como se fosse uma cópia local.
+        Volatile.Write(ref lastRemoteClipboardText, text);
+        try { clipboard.SetText(text); }
+        catch (Exception) { /* clipboard indisponível: ignora esta mensagem */ }
+    }
+
+    /// <summary>
+    /// Recebe um arquivo em blocos do Mac. <c>fileStart</c> abre a
+    /// transferência; <c>fileChunk</c> acrescenta bytes. O bloco com
+    /// <c>isLast</c> fecha o arquivo e responde com <c>fileReceived</c> e o nome
+    /// higienizado. Bloco inválido, grande demais ou falha de disco não encerram
+    /// a sessão: o Mac recebe <c>error</c> e pode recomeçar.
+    /// </summary>
+    private async Task HandleFileAsync(SslStream tls, JsonElement root, CancellationToken token)
+    {
+        bool isStart = string.Equals(GetString(root, "type"), "fileStart", StringComparison.Ordinal);
+        bool isLast = GetBool(root, "isLast");
+        bool isFirst = isStart || GetBool(root, "isFirst");
+
+        byte[] data = [];
+        string? encoded = GetString(root, "data");
+        if (encoded is not null)
+        {
+            try { data = Convert.FromBase64String(encoded); }
+            catch (FormatException)
+            {
+                await TrySendErrorAsync(tls, "Bloco de arquivo inválido.", token).ConfigureAwait(false);
+                return;
+            }
+        }
+
+        if (data.Length > FileReceiver.MaxChunkBytes)
+        {
+            await TrySendErrorAsync(tls, "Bloco de arquivo acima do limite.", token).ConfigureAwait(false);
+            return;
+        }
+
+        string saved;
+        try
+        {
+            saved = fileReceiver.SaveChunk(GetString(root, "name"), data, isFirst, isLast);
+        }
+        catch (Exception)
+        {
+            // Nome impossível, disco cheio ou pasta removida: a mensagem é
+            // descartada sem derrubar o streaming da sessão.
+            await TrySendErrorAsync(tls, "Arquivo recusado.", token).ConfigureAwait(false);
+            return;
+        }
+
+        if (!isLast) return;
+
+        await SendControlAsync(
+            tls, new { type = "fileReceived", name = Path.GetFileName(saved) }, token).ConfigureAwait(false);
+        Status?.Invoke("Arquivo recebido do Mac: " + Path.GetFileName(saved));
+    }
+
+    /// <summary>
+    /// Envia ao Mac o texto copiado no Windows. A sequência é lida a cada
+    /// intervalo; só uma mudança real dispara a leitura do conteúdo, evitando
+    /// abrir o clipboard sem necessidade.
+    /// </summary>
+    private async Task WatchClipboardAsync(SslStream tls, CancellationToken token)
+    {
+        uint lastSequence = clipboard.SequenceNumber;
+        while (!token.IsCancellationRequested)
+        {
+            try { await Task.Delay(ClipboardPollMilliseconds, token).ConfigureAwait(false); }
+            catch (OperationCanceledException) { return; }
+
+            uint sequence = clipboard.SequenceNumber;
+            if (sequence == lastSequence) continue;
+            lastSequence = sequence;
+
+            string text;
+            try
+            {
+                if (!clipboard.TryGetText(out text) || text.Length == 0) continue;
+            }
+            catch (Exception) { continue; }
+
+            if (Encoding.UTF8.GetByteCount(text) > WindowsClipboard.MaxTextBytes) continue;
+            if (string.Equals(text, Volatile.Read(ref lastRemoteClipboardText), StringComparison.Ordinal)) continue;
+
+            try
+            {
+                await SendControlAsync(tls, new { type = "clipboard", text }, token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) { return; }
+            catch (ProtocolException) { /* acima do limite de controle: descarta */ }
+            catch (IOException) { return; }
+            catch (ObjectDisposedException) { return; }
+        }
+    }
+
     private async Task SendWindowsAsync(SslStream tls, CancellationToken token)
     {
         IReadOnlyList<WindowDescriptor> windows;
         try { windows = windowList?.Invoke() ?? []; }
         catch { windows = []; }
+
+        IReadOnlyList<MonitorInfo> monitors;
+        try { monitors = MonitorEnumerator.GetMonitors(); }
+        catch { monitors = []; }
 
         await SendControlAsync(tls, new
         {
@@ -901,7 +1225,27 @@ internal sealed class RemoteServer : IDisposable
                 title = window.Title,
                 process = window.Process,
                 width = window.Width,
-                height = window.Height
+                height = window.Height,
+                icon = window.IconBase64
+            }).ToArray(),
+            monitors = monitors.Select((monitor, index) => new
+            {
+                id = monitor.Id,
+                name = $"Monitor {index + 1}",
+                width = monitor.Width,
+                height = monitor.Height,
+                x = monitor.X,
+                y = monitor.Y,
+                primary = monitor.Primary
+            }).ToArray(),
+            // Lista segura de aplicativos que o Mac pode pedir para abrir.
+            // `cmd` é o nome de campo esperado por mac/.../Protocol.swift.
+            apps = AppLauncher.GetKnownApps().Select(app => new
+            {
+                id = app.Id,
+                name = app.Name,
+                cmd = app.Command,
+                icon = app.Icon
             }).ToArray()
         }, token).ConfigureAwait(false);
     }
@@ -985,6 +1329,9 @@ internal sealed class RemoteServer : IDisposable
             value.ValueKind == JsonValueKind.Number &&
             value.TryGetInt32(out result);
     }
+
+    private static bool GetBool(JsonElement root, string name) =>
+        root.TryGetProperty(name, out JsonElement value) && value.ValueKind == JsonValueKind.True;
 
     private static int CeilSeconds(TimeSpan value) =>
         value <= TimeSpan.Zero ? 0 : (int)Math.Ceiling(value.TotalSeconds);
@@ -1072,6 +1419,7 @@ internal sealed class RemoteServer : IDisposable
         }
 
         if (ownsCertificate) certificate.Dispose();
+        if (ownsFileReceiver) fileReceiver.Dispose();
         foreach (SemaphoreSlim gate in writeGates.Values) gate.Dispose();
         writeGates.Clear();
         stop.Dispose();

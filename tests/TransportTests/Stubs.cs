@@ -3,6 +3,7 @@ namespace WindowProbe.Remote
 {
     internal sealed class RemoteInput(IntPtr hwnd) : IDisposable
     {
+        public RemoteInput(IntPtr monitor, bool fullScreen) : this(monitor) { _ = fullScreen; }
         public bool AllowHover { get; set; } = true;
         public void Dispose() { }
         public string? TryApply(System.Text.Json.JsonElement message)
@@ -27,6 +28,7 @@ namespace WindowProbe.Capture
         /// <summary>Métrica opcional do pipeline; nula no teste de protocolo.</summary>
         public Action<TimeSpan, TimeSpan>? Timings { get; init; }
 
+        public IntPtr MonitorHandle { get; init; }
         public bool RawPixels { get; init; }
         public Func<RawPixelFrame, CancellationToken, Task>? RawFrame { get; init; }
     }

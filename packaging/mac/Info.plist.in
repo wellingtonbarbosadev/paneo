@@ -8,6 +8,8 @@
 	<string>remoteDesktop</string>
 	<key>CFBundleExecutable</key>
 	<string>RemoteDesktop</string>
+	<key>CFBundleIconFile</key>
+	<string>Paneo.icns</string>
 	<key>CFBundleIdentifier</key>
 	<string>dev.remotedesktop.client</string>
 	<key>CFBundleInfoDictionaryVersion</key>

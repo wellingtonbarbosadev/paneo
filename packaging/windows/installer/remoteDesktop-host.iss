@@ -3,7 +3,8 @@
 ; Regras deste escopo:
 ;   * PrivilegesRequired=lowest: instala em {localappdata}, sem administracao.
 ;   * Nenhuma regra de firewall, servico, tarefa agendada, registro proprio
-;     nem inicializacao automatica e criada.
+;     nem inicializacao automatica e criada pelo instalador. O usuario pode
+;     habilitar inicio apos login no host; a desinstalacao remove essa opcao.
 ;   * Versao deve ser igual a packaging/VERSION; confira com
 ;     packaging/check-versions.sh antes de compilar.
 ;   * Sem certificado de assinatura: SmartScreen pode avisar na primeira
@@ -34,6 +35,7 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir=..\dist
 OutputBaseFilename=remoteDesktop-host-{#MyAppVersion}-win-x64-setup
+SetupIconFile=../../../assets/branding/paneo.ico
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
@@ -61,3 +63,6 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Parameter
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Parameters: "--host"; WorkingDir: "{app}"; Description: "Iniciar {#MyAppName}"; Flags: nowait postinstall skipifsilent
+
+[UninstallRun]
+Filename: "{app}\{#MyAppExeName}"; Parameters: "--host --disable-startup"; WorkingDir: "{app}"; RunOnceId: "DisablePaneoStartup"; Flags: runhidden skipifdoesntexist

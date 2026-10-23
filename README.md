@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/branding/paneo-logo-v2-minimal.png" alt="Paneo logo" width="160" />
+</p>
+
 # Paneo
 
 [![Platform: Windows & macOS](https://img.shields.io/badge/platform-Windows%20%7C%20macOS-blue.svg)](https://github.com/wellingtonbarbosadev/paneo)
@@ -72,6 +76,26 @@ flowchart LR
 2. The host UI opens and automatically engages the display lock.
 3. Configure your 6-digit PIN (or use the generated PIN).
 4. Note the displayed Local IP address (and default port `9443`).
+
+### Start the Windows host automatically
+
+After saving a PIN, enable **Iniciar e compartilhar automaticamente ao entrar no Windows**
+in the host window. At the next login to that Windows account, the host starts
+sharing with the saved PIN, port and hover preference, then minimizes to the taskbar.
+Uncheck the option to disable it. Closing the host stops sharing.
+
+For an installed executable, the equivalent commands are:
+
+```powershell
+.\WindowProbe.exe --host --enable-startup
+.\WindowProbe.exe --host --disable-startup
+```
+
+Startup uses the current user's `Run` registry entry and does not require admin
+rights. Enable it from a stable installation directory, since moving the executable
+requires enabling it again. No Windows password is stored or automatic Windows login
+configured. **Remote access before login, unlocking Windows and UAC secure desktop
+control are not supported by the current host.**
 
 ### 2. macOS Client Setup
 
