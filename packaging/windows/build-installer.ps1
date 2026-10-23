@@ -1,4 +1,4 @@
-# Compila o instalador por usuario do remoteDesktop Host com Inno Setup 6.
+# Compila o instalador por usuario do Paneo Host com Inno Setup 6.
 # Sem administracao: PrivilegesRequired=lowest no .iss. Nao cria firewall,
 # servico, tarefa agendada nem inicializacao automatica.
 # Windows: powershell -ExecutionPolicy Bypass -File packaging\windows\build-installer.ps1
@@ -55,7 +55,7 @@ if ($LASTEXITCODE -ne 0) {
     throw "ISCC falhou com codigo $LASTEXITCODE"
 }
 
-$setup = Get-ChildItem -LiteralPath $distDir -Filter 'remoteDesktop-host-*-setup.exe' -ErrorAction SilentlyContinue
+$setup = Get-ChildItem -LiteralPath $distDir -Filter 'Paneo-host-*-setup.exe' -ErrorAction SilentlyContinue
 if (-not $setup) {
     throw "instalador nao encontrado em $distDir"
 }

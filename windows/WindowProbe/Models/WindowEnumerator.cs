@@ -23,11 +23,6 @@ public static class WindowEnumerator
                     return true;
                 }
 
-                if (NativeMethods.IsIconic(hwnd))
-                {
-                    return true;
-                }
-
                 if (NativeMethods.IsWindowCloaked(hwnd))
                 {
                     return true;
@@ -69,7 +64,9 @@ public static class WindowEnumerator
                     title,
                     width,
                     height,
-                    WindowIconExtractor.GetIconBase64(hwnd, processId, processName)));
+                    WindowIconExtractor.GetIconBase64(hwnd, processId, processName),
+                    NativeMethods.IsIconic(hwnd),
+                    NativeMethods.CanResizeWindow(hwnd)));
             }
             catch
             {

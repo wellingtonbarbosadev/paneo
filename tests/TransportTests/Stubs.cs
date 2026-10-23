@@ -1,15 +1,41 @@
 // Substitutos explícitos: estes testes verificam o servidor TLS real, não WGC/SendInput.
 namespace WindowProbe.Remote
 {
+    internal sealed class FakeWindowCommands(long windowId, RemoteWindowMenus? menus = null) : IWindowCommands
+    {
+        private bool minimized, maximized, reading;
+        public RemoteWindowState State => new(windowId, minimized, maximized, reading, true);
+        public RemoteWindowCommandResult Execute(System.Text.Json.JsonElement command)
+        {
+            string action = command.GetProperty("action").GetString()!;
+            switch (action)
+            {
+                case "minimize": minimized = true; break;
+                case "maximize": reading = false; maximized = true; minimized = false; break;
+                case "restore": reading = false; maximized = false; minimized = false; break;
+                case "close": reading = false; break;
+                case "reading": reading = command.GetProperty("enabled").GetBoolean(); break;
+                case "state": break;
+                default: return new(action, false, "unknown");
+            }
+            return new(action, true, "OK");
+        }
+        public RemoteWindowMenus GetMenus() => menus ?? new(true, [new("fake:1", "Arquivo", true, false, false, [])]);
+        public RemoteWindowCommandResult InvokeMenu(string id) => id == "fake:1" ? new("menu", true, "OK") : new("menu", false, "stale");
+        public void Dispose() { }
+    }
+
     internal sealed class RemoteInput(IntPtr hwnd) : IDisposable
     {
         public RemoteInput(IntPtr monitor, bool fullScreen) : this(monitor) { _ = fullScreen; }
         public bool AllowHover { get; set; } = true;
         public void Dispose() { }
-        public string? TryApply(System.Text.Json.JsonElement message)
+        public string? TryApply(System.Text.Json.JsonElement message, double inputScaleX = 1, double inputScaleY = 1)
         {
             _ = hwnd;
             _ = message;
+            _ = inputScaleX;
+            _ = inputScaleY;
             return "Entrada não habilitada no teste de protocolo.";
         }
     }
@@ -57,6 +83,8 @@ namespace WindowProbe.Capture
 
     public static class ContinuousWindowCapture
     {
+        public static (int Width, int Height) RawSize { get; set; } = (320, 240);
+
         public static async Task<ContinuousCaptureSummary> RunAsync(
             IntPtr hwnd,
             Func<CapturedFrame, CancellationToken, Task> callback,
@@ -81,10 +109,10 @@ namespace WindowProbe.Capture
                 }
                 if (options is not null && options.RawPixels && options.RawFrame is not null)
                 {
-                    // Quadro BGRA 320x240 sintético (múltiplo de 16, aceito pelo encoder).
-                    var pixels = new byte[320 * 240 * 4];
+                    var (width, height) = RawSize;
+                    var pixels = new byte[width * height * 4];
                     Array.Fill(pixels, (byte)128);
-                    await options.RawFrame(new RawPixelFrame(++sequence, pixels, 320, 240, 320 * 4, watch.Elapsed), ct);
+                    await options.RawFrame(new RawPixelFrame(++sequence, pixels, width, height, width * 4, watch.Elapsed), ct);
                     continue;
                 }
                 await callback(new CapturedFrame(++sequence, png, 4, 3, watch.Elapsed, TimeSpan.Zero), ct);

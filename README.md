@@ -99,12 +99,32 @@ control are not supported by the current host.**
 
 ### 2. macOS Client Setup
 
-1. Open `Paneo.app` (or mount `packaging/mac/dist/remoteDesktop-0.1.0-mac-arm64.dmg`).
-2. Enter the Windows PC **IP address** and your **PIN**.
+1. Open `Paneo.app` (or mount `packaging/mac/dist/Paneo-0.1.0-mac-arm64.dmg`).
+2. Selecione um PC próximo ou informe o **IP** manualmente e o **PIN** do Windows.
 3. Click **Connect**:
    - The device token is stored securely in your macOS Keychain.
    - Paneo immediately lists all active Windows applications on the top horizontal bar.
 4. Click on any application thumbnail card to start interacting at 60 FPS!
+
+### Customize your workspace
+
+Open **Ajustes…** with the always-visible gear button, from the app menu, or press **⌘,**.
+Settings open in the main window, with a **Back** button to return to your session.
+The page includes visual choices and a live preview for the app bar's
+position (top, bottom, left or right), density (large previews, compact cards or
+icons), light/dark/system appearance, and accent color. The defaults are a top
+bar with compact cards and the system appearance. Changes apply and save immediately on this Mac.
+
+Short transitions accompany navigation, search, cards, and settings, respecting
+the system's reduced-motion preference. Session metrics are available under
+**Detalhes**; **Reconectar** appears when the stream needs recovery. The Windows
+host follows the same Paneo visual language, with a guided PIN/sharing/session
+layout, a copyable IP address, advanced options, and a status footer.
+
+Right-click an app card to add it to **Favoritos**. Favorites are saved per PC
+and can be reordered by dragging. Clicking a favorite opens its window, or offers
+a window chooser when several are open. Closed favorites can launch apps supported
+by the Windows host's existing launcher; other apps must first be opened on the PC.
 
 ---
 
@@ -122,9 +142,29 @@ control are not supported by the current host.**
 ./packaging/mac/build-mac.sh
 
 # The signed app and DMG are generated in packaging/mac/dist:
-# - packaging/mac/dist/RemoteDesktop.app
-# - packaging/mac/dist/remoteDesktop-0.1.0-mac-arm64.dmg
+# - packaging/mac/dist/Paneo.app
+# - packaging/mac/dist/Paneo-0.1.0-mac-arm64.dmg
 ```
+
+The packaging script signs both artifacts with the local **Paneo Development**
+identity by default. To select another matching code-signing identity from the macOS Keychain,
+set `PANEO_CODESIGN_IDENTITY="Identity Name"` before running it. Ad-hoc signing
+is available only when explicitly selected with `PANEO_CODESIGN_IDENTITY=-`;
+the script stops before SwiftPM or cleaning `dist` if the selected identity is
+missing. This local certificate is for development on that Mac, not Developer
+ID, notarization, or distribution. A stable certificate keeps the code
+signature's designated requirement stable, but does **not** guarantee that
+Keychain items will stop prompting: runtime checks found that macOS can assign
+unsigned/self-signed developers a per-build `cdhash` Keychain partition even
+when the designated requirement and certificate stay the same. Apple’s
+[securityd client-identification](https://github.com/apple-oss-distributions/Security/blob/main/securityd/src/clientid.cpp)
+and [partition ACL](https://github.com/apple-oss-distributions/Security/blob/main/securityd/src/acls.cpp)
+sources describe this separate partition check. An Apple-issued Apple
+Development identity associated with a team may provide a stable team
+partition; a Personal Team may be available through Xcode depending on the
+account, but this path has not been configured or tested here and does not
+validate access to legacy items. Existing ad-hoc items may still ask for
+authorization or require user-approved migration.
 
 To run a fast development build via Swift CLI:
 ```bash
@@ -148,7 +188,13 @@ The resulting executable will be at `windows/WindowProbe/bin/Release/net10.0-win
 
 ```bash
 # Run unit & transport protocol tests (.NET)
-dotnet test tests/TransportTests/TransportTests.csproj -c Release
+dotnet run --project tests/TransportTests/TransportTests.csproj -c Release
+dotnet run --project tests/AppCatalogTests/AppCatalogTests.csproj -c Release
+dotnet run --project tests/VideoQualityChecks/VideoQualityChecks.csproj -c Release
+
+# Layout, preferências e controles no Mac (sem credenciais reais)
+mac/RemoteDesktop/Scripts/test-customization.sh
+mac/RemoteDesktop/Scripts/test-stream-controls.sh
 
 # Run Mac transport & reconnection fixtures
 python3 scripts/test-mac-transport.py

@@ -42,7 +42,7 @@ internal static class RealAppSoak
             uint dpi = GetDpiForWindow(target);
             string pin = RandomNumberGenerator.GetInt32(10_000_000, 100_000_000).ToString(System.Globalization.CultureInfo.InvariantCulture);
             var credentials = HostCredentials.Create(pin);
-            server = new RemoteServer(target, IPAddress.Any, 0, credentials, certificate: null);
+            server = new RemoteServer(target, IPAddress.Any, 9445, credentials, certificate: null);
             server.Start();
             await File.WriteAllTextAsync(session, JsonSerializer.Serialize(new { host = "192.168.0.100", port = server.Port, fingerprint = server.Fingerprint, pin }));
             var deadline = Stopwatch.StartNew();

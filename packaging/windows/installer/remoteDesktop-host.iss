@@ -1,4 +1,4 @@
-; remoteDesktop Host — instalador POR USUARIO (Inno Setup 6.3+).
+; Paneo Host — instalador POR USUARIO (Inno Setup 6.3+).
 ;
 ; Regras deste escopo:
 ;   * PrivilegesRequired=lowest: instala em {localappdata}, sem administracao.
@@ -12,9 +12,9 @@
 ;
 ; Compilar: powershell -ExecutionPolicy Bypass -File packaging\windows\build-installer.ps1
 
-#define MyAppName "remoteDesktop Host"
+#define MyAppName "Paneo Host"
 #define MyAppVersion "0.1.0"
-#define MyAppPublisher "Uso pessoal (remoteDesktop)"
+#define MyAppPublisher "Paneo"
 #define MyAppExeName "WindowProbe.exe"
 
 [Setup]
@@ -34,7 +34,7 @@ MinVersion=10.0.19041
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir=..\dist
-OutputBaseFilename=remoteDesktop-host-{#MyAppVersion}-win-x64-setup
+OutputBaseFilename=Paneo-host-{#MyAppVersion}-win-x64-setup
 SetupIconFile=../../../assets/branding/paneo.ico
 Compression=lzma2
 SolidCompression=yes
@@ -58,7 +58,7 @@ Name: "desktopicon"; Description: "Criar atalho na Area de Trabalho"; GroupDescr
 Source: "..\publish\win-x64\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Parameters: "--host"; WorkingDir: "{app}"; Comment: "Host experimental PNG/TLS do remoteDesktop"
+Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Parameters: "--host"; WorkingDir: "{app}"; Comment: "Compartilhe aplicativos Windows com o Paneo no Mac"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Parameters: "--host"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Run]

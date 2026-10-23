@@ -33,6 +33,18 @@ public partial class App : Application
             Shutdown(await Remote.RemoteSmoke.RunAsync(e.Args[1]));
             return;
         }
+        if (e.Args.Length == 2 && e.Args[0] == "--window-commands-smoke")
+        {
+            ShutdownMode = ShutdownMode.OnExplicitShutdown;
+            Shutdown(await Remote.WindowCommandsSmoke.RunAsync(e.Args[1]));
+            return;
+        }
+        if (e.Args.Length == 2 && e.Args[0] == "--application-compatibility-smoke")
+        {
+            ShutdownMode = ShutdownMode.OnExplicitShutdown;
+            Shutdown(await Remote.ApplicationCompatibilitySmoke.RunAsync(e.Args[1]));
+            return;
+        }
         if (e.Args.Length == 2 && e.Args[0] == "--host-performance-smoke")
         {
             ShutdownMode = ShutdownMode.OnExplicitShutdown;

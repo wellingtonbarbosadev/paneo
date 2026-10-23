@@ -1,45 +1,75 @@
-# Cliente Mac experimental
+# Cliente Paneo para Mac
 
-AppKit/Swift, macOS 14+, sem dependências externas. Compilar:
+Swift 6/AppKit, macOS 14+, sem dependências externas. Compilar:
 
 ```sh
 swift build --package-path mac/RemoteDesktop
-swift run --package-path mac/RemoteDesktop RemoteDesktop
+./packaging/mac/build-mac.sh
 ```
 
-No Windows, executar WindowProbe com `--host`, escolher a janela, informar o IP
-local da interface de rede e iniciar. No Mac, preencher IP, porta, impressão
-SHA-256 e token exibidos pelo host. O certificado deve ser conferido por um
-canal confiável (por exemplo, olhando o PC). O host preserva o pareamento até
-revogação. O Mac pode salvar as credenciais no Chaves após autenticar.
+O segundo comando gera `Paneo.app` e DMG com a identidade local configurada.
+Consulte [instaladores](../../docs/INSTALLERS.md) para os limites de assinatura.
 
-O conteúdo é PNG sobre TLS, com confirmação após desenhar cada imagem. Clique
-na imagem para dar foco à entrada. Suporta cliques esquerdo/direito, texto
-Unicode com composição pelo layout macOS, arraste, rolagem, setas, Enter, Tab,
-Escape, Backspace, Delete, Home/End, PageUp/PageDown, F1–F12 e Control+A–Z.
-Command continua reservado aos menus do Mac.
-Copiar/colar com Control usa o clipboard do Windows, sem sincronizar o Mac.
+No Windows, abrir o host, salvar um PIN e iniciar o compartilhamento. No Mac,
+selecionar um PC próximo na lista Bonjour ou preencher IP/porta manualmente.
+Informar o PIN na primeira conexão; as próximas usam o token do dispositivo
+salvo no Chaves. A descoberta não dispensa autenticação e o certificado salvo
+continua fixado ao host. A revogação é feita no Windows.
 
-Trocar o foco para outra janela desconecta e descarta comandos pendentes.
-Voltar ao foco reconecta; interrupções têm até cinco tentativas com espera
-crescente. Arquivo → Nova Conexão abre outro visualizador para outra porta
-autorizada pelo host. Redimensionar mantém a proporção da imagem, sem
-redimensionar a janela Windows. Menus/diálogos não são associados automaticamente.
-Teclado físico PT-BR completo ainda exige validação. Nenhuma promessa
-de desempenho WebRTC: este transporte é um protótipo de diagnóstico.
+Após conectar, selecionar uma janela ou monitor na barra. **Apps** busca
+janelas abertas e aplicativos publicados pelo Windows. A lista distingue
+**Abertos agora** e **Aplicativos instalados**; o lançador só aceita IDs do
+catálogo do host. **Vídeo** controla qualidade, limite de resolução e 30/60 FPS.
+As escolhas valem para a sessão e são reaplicadas após reconectar. A opção
+automática usa o RTT; uma qualidade manual não é sobrescrita pelo ajuste automático.
 
-Teste automatizado, exclusivamente com a janela sintética de RemoteSmoke:
+H.264 sobre TLS/TCP v2 é o caminho principal, com PNG de fallback. O limite
+de resolução reduz a transmissão sem ampliar imagens menores, mantendo a
+proporção; o fallback informa quando não pode aplicá-lo. Janelas abertas atrás
+de outras fazem parte do escopo, sem garantia para conteúdo protegido,
+programas elevados ou transmissão de janelas minimizadas.
+
+Mouse, hover, arraste, rolagem, composição Unicode e atalhos são encaminhados
+ao Windows. A perda de foco libera entrada mantida. Falhas transitórias usam
+até cinco tentativas com espera crescente; certificado divergente, autenticação
+recusada ou protocolo incompatível interrompem a recuperação. Retomar uma
+janela não repete comandos de abertura, arquivos ou entrada antiga.
+
+Temas, barra nas quatro bordas, densidades, favoritos e janelas destacadas
+continuam disponíveis. A engrenagem e ⌘, abrem Ajustes em popup modal sobre a janela principal;
+Fechar/Esc devolve o foco ao formulário ou workspace. ⌘K abre a busca.
+
+O botão **Janela** controla a janela Windows selecionada: minimizar,
+maximizar/restaurar e solicitar o fechamento normal. Os botões nativos do Mac
+continuam controlando apenas o visualizador. Uma janela minimizada mantém seu
+card; selecione-o ou use Restaurar para retomar o vídeo.
+
+**Modo leitura** ajusta a janela Windows à área disponível no Mac, levando o DPI
+em conta e respeitando a área útil do monitor. Ao desligar o modo, trocar de
+janela ou desconectar, o host restaura a posição, o tamanho e o estado anteriores.
+Esse modo não é reaplicado após reconexão.
+
+Em **Janela → Menus do aplicativo**, menus Win32 padrão aparecem com submenus,
+itens marcados e desabilitados. Aplicativos com menus customizados podem não
+oferecer essa integração; o Paneo informa a limitação e mantém o acesso pelo
+vídeo. Hosts antigos deixam os novos controles indisponíveis.
+
+## Validação
 
 ```sh
-RemoteDesktop --remote-smoke /caminho/privado/session.json /caminho/resultado.json
+mac/RemoteDesktop/Scripts/test-customization.sh
+mac/RemoteDesktop/Scripts/test-settings.sh
+mac/RemoteDesktop/Scripts/test-stream-controls.sh
+mac/RemoteDesktop/Scripts/test-window-commands.sh
+mac/RemoteDesktop/Scripts/test-cursor-interaction.sh
+python3 scripts/test-mac-transport.py
+python3 scripts/test-mac-reconnect.py
 ```
 
-O arquivo de sessão contém host, port, fingerprint e token; deve ter permissões
-restritas e ser removido depois. O teste recebe 10 imagens, clica no editor e
-envia uma frase fixa. Relatório e último PNG não contêm credenciais. O teste
-local com servidor sintético é `python3 scripts/test-mac-transport.py`; a prova
-Windows real está documentada em `docs/VALIDATION.md`.
+Os harnesses usam preferências/credenciais sintéticas, sem o pareamento real.
+A fixture local não comprova captura nem entrada Windows; essas exigem sessão
+no PC. `--remote-smoke` continua disponível para janela sintética autorizada,
+com arquivo privado contendo host, port, fingerprint e PIN efêmero. Nunca
+imprimir esse arquivo; removê-lo após o teste.
 
-`python3 scripts/test-mac-reconnect.py` valida o controlador real após queda TLS
-e rejeição de pin alterado, usando fixture local e sem tocar no perfil do Chaves.
-Detalhes: [pareamento e controles](../../docs/PAIRING-AND-CONTROLS.md).
+Internet direta gratuita permanece na próxima etapa de [PLAN.md](../../PLAN.md).

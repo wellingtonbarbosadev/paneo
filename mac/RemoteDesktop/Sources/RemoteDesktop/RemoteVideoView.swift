@@ -363,7 +363,7 @@ final class RemoteVideoView: NSView, @preconcurrency NSTextInputClient {
 
             // Deixa atalhos reservados do app macOS passarem para o menu:
             // ⌘Q (quit), ⌘W (close), ⌘M (minimize), ⌘H (hide), ⌘K (busca rápida), ⌘` (alternar janela)
-            if char == "q" || char == "w" || char == "m" || char == "h" || char == "k" || char == "`" || event.keyCode == 50 {
+            if char == "q" || char == "w" || char == "m" || char == "h" || char == "k" || char == "," || char == "`" || event.keyCode == 50 {
                 super.keyDown(with: event)
                 return
             }

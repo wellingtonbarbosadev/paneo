@@ -6,9 +6,11 @@ import AppKit
 /// Dois modos:
 /// - **Smoke original (preservado)**: sem `durationSeconds`, envia a sequência
 ///   fixa de entrada no primeiro quadro e encerra no décimo.
-/// - **Desempenho**: `durationSeconds` (1–60 s) mede o vídeo por esse tempo
-///   após o primeiro access unit H.264, SEM enviar entrada, com a janela e a
-///   `AVSampleBufferDisplayLayer` visíveis. O relatório separa quadros
+/// - **Desempenho**: `durationSeconds` mede o vídeo por esse tempo depois do
+///   primeiro access unit; acima de 60 s exige `allowLongDuration: true`
+///   e aceita até uma hora para permitir soak sem tornar um JSON comum indefinido.
+///   Não envia entrada; mantém a janela e a `AVSampleBufferDisplayLayer`
+///   visíveis. O relatório separa quadros
 ///   recebidos, decodificados e ENFILEIRADOS para a camada de apresentação.
 ///   `onPresented` conta enfileiramento — não prova vsync nem exibição física.
 /// O PIN nunca aparece em stdout nem no relatório.
@@ -19,9 +21,12 @@ final class RemoteSmoke {
         let port: UInt16
         let fingerprint: String?
         let pin: String
-        /// Modo de desempenho: duração da medição em segundos (1–60). Ausente
-        /// ou nulo mantém o smoke original de 10 quadros com entrada fixa.
+        /// Modo de desempenho: duração da medição em segundos (1–3600).
+        /// Ausente ou nulo mantém o smoke original de 10 quadros com entrada fixa.
         let durationSeconds: Int?
+        let allowLongDuration: Bool?
+        let windowId: Int64?
+        let maxDimension: Int?
     }
 
     private static let fixedText = "Teste remoto: ação 123."
@@ -44,6 +49,7 @@ final class RemoteSmoke {
 
     /// Duração pedida para a janela de medição; nil mantém o smoke original.
     private let measureSeconds: TimeInterval?
+    private let requestedMaxDimension: Int
     /// Access units H.264 recebidas. Nenhuma é descartada pelo smoke: todas
     /// passam pelo decodificador (a espera por keyframe é decisão dele).
     private var receivedAccessUnits = 0
@@ -59,6 +65,8 @@ final class RemoteSmoke {
     private var lastHeaderWidth = 0
     private var lastHeaderHeight = 0
     private var unexpectedCodecReported = false
+    private var lastMediaNs: UInt64?
+    private var maxMediaGapSeconds = 0.0
 
     private struct MeasureSnapshot {
         var received: Int
@@ -91,10 +99,15 @@ final class RemoteSmoke {
             guard let hex = CertificatePin.normalizedFingerprint(raw) else { throw ProtocolError.malformed }
             fingerprint = hex
         }
-        if let seconds = session.durationSeconds, !(1...60).contains(seconds) {
-            throw ProtocolError.malformed // durationSeconds deve ficar em 1..60
+        if let seconds = session.durationSeconds,
+           (!(1...3600).contains(seconds) || (seconds > 60 && session.allowLongDuration != true)) {
+            throw ProtocolError.malformed // Soak acima de 60 s exige opt-in explícito.
         }
         measureSeconds = session.durationSeconds.map { TimeInterval($0) }
+        requestedMaxDimension = session.maxDimension ?? 0
+        guard requestedMaxDimension == 0 || (320...4096).contains(requestedMaxDimension) else {
+            throw ProtocolError.malformed
+        }
 
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 800, height: 500),
                           styleMask: [.titled, .closable], backing: .buffered, defer: false)
@@ -137,7 +150,13 @@ final class RemoteSmoke {
 
         connection = RemoteConnection(
             onState: { [weak self] message, ready in
-                guard let self, !ready, !self.completed else { return }
+                guard let self, !self.completed else { return }
+                if ready {
+                    if self.requestedMaxDimension != 0 {
+                        self.connection?.sendQuality(fps: 60, bitrate: 6_000_000, maxDimension: self.requestedMaxDimension)
+                    }
+                    return
+                }
                 self.errors.append(message)
                 self.finish(success: self.measureSeconds == nil && self.frames >= 10)
             },
@@ -168,6 +187,11 @@ final class RemoteSmoke {
                 }
                 // Nenhuma access unit H.264 é descartada pelo smoke.
                 self.receivedAccessUnits += 1
+                let receivedAt = Self.monotonicNs()
+                if let previous = self.lastMediaNs {
+                    self.maxMediaGapSeconds = max(self.maxMediaGapSeconds, Double(receivedAt - previous) / 1_000_000_000)
+                }
+                self.lastMediaNs = receivedAt
                 self.lastHeaderWidth = width
                 self.lastHeaderHeight = height
                 if self.measureStartNs == nil, self.measureSeconds != nil {
@@ -193,7 +217,7 @@ final class RemoteSmoke {
             }
         )
         connection?.connect(host: session.host, port: session.port, pin: session.pin,
-                            deviceToken: nil, fingerprint: fingerprint)
+                            deviceToken: nil, fingerprint: fingerprint, windowId: session.windowId)
 
         // Guarda de segurança idêntica à do smoke original: encerra após 25 s
         // caso nada chegue. Cancelada quando a medição começa.
@@ -211,9 +235,40 @@ final class RemoteSmoke {
         guardTask?.cancel()
         guardTask = nil
         measureTask = Task { @MainActor [weak self] in
-            do { try await Task.sleep(for: .seconds(seconds)) } catch { return }
-            self?.finish(success: true)
+            guard let self else { return }
+            for elapsed in 1...Int(seconds) {
+                do { try await Task.sleep(for: .seconds(1)) } catch { return }
+                guard !self.completed else { return }
+                if let last = self.lastMediaNs, Self.monotonicNs() - last > 10_000_000_000 {
+                    self.errors.append("Vídeo sem novos quadros por mais de 10 s.")
+                    self.finish(success: false)
+                    return
+                }
+                if elapsed.isMultiple(of: 60) { self.writeProgress(elapsedSeconds: elapsed) }
+            }
+            self.finish(success: true)
         }
+    }
+
+    /// Checkpoints sem conteúdo nem credenciais, para acompanhar um soak ativo.
+    private func writeProgress(elapsedSeconds: Int) {
+        let lastFrameAge = lastMediaNs.map { Double(Self.monotonicNs() - $0) / 1_000_000_000 }
+        let report: [String: Any] = [
+            "mode": "performance",
+            "elapsedSeconds": elapsedSeconds,
+            "requestedDurationSeconds": Int(measureSeconds ?? 0),
+            "receivedAccessUnits": receivedAccessUnits,
+            "decodedFrames": decodedFrames,
+            "displayEnqueuedFrames": displayEnqueuedFrames,
+            "displayEnqueueRejected": displayEnqueueRejected,
+            "lastFrameAgeSeconds": lastFrameAge.map { $0 as Any } ?? NSNull(),
+            "maxMediaGapSeconds": maxMediaGapSeconds,
+            "errors": errors
+        ]
+        do {
+            let data = try JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys])
+            try data.write(to: URL(fileURLWithPath: output.path + ".progress.json"), options: .atomic)
+        } catch { errors.append("Não foi possível gravar checkpoint do soak.") }
     }
 
     /// Contador do smoke original: quadros de vídeo que entram (PNG ou H.264
@@ -302,7 +357,11 @@ final class RemoteSmoke {
             "mode": "performance",
             // Sucesso exige janela completa com quadros decodificados E
             // enfileirados — decodificar sem exibir é a falha conhecida.
-            "success": passed && measuredSeconds >= requested && inWindowDecoded > 0 && inWindowEnqueued > 0 && errors.isEmpty && layer.status == .rendering,
+            "success": passed && measuredSeconds >= requested && inWindowDecoded > 0 && inWindowEnqueued > 0 && errors.isEmpty && layer.status == .rendering
+                && (requestedMaxDimension == 0 || (lastHeaderWidth > 0 && lastHeaderHeight > 0
+                    && lastHeaderWidth <= requestedMaxDimension && lastHeaderHeight <= requestedMaxDimension
+                    && Int(decodedSize.width) == lastHeaderWidth && Int(decodedSize.height) == lastHeaderHeight)),
+            "requestedMaxDimension": requestedMaxDimension,
             "targetFps": 60,
             "meets60Fps": decodedFps >= 60 && enqueuedFps >= 60,
             "requestedDurationSeconds": Int(requested),
@@ -321,6 +380,8 @@ final class RemoteSmoke {
             "displayEnqueuedFramesInMeasurement": inWindowEnqueued,
             "displayEnqueuedFps": enqueuedFps,
             "displayEnqueueRejected": displayEnqueueRejected,
+            "maxMediaGapSeconds": maxMediaGapSeconds,
+            "finalFrameAgeSeconds": lastMediaNs.map { Double(endNs - $0) / 1_000_000_000 } ?? 0,
             "displayLayerStatus": statusName,
             "displayLayerReadyForMoreMediaData": layer.isReadyForMoreMediaData,
             "decoderErrors": errors.filter { $0.hasPrefix("Decodificador:") }.count,

@@ -14,7 +14,7 @@ enum SearchPaletteItem {
     var subtitle: String {
         switch self {
         case .window(let win): return win.isMonitor ? "Tela do Windows" : win.process
-        case .app(let app): return "Novo aplicativo Windows (\(app.cmd))"
+        case .app: return "Aplicativo instalado no Windows"
         }
     }
 
@@ -31,6 +31,37 @@ enum SearchPaletteItem {
         case .app: return false
         }
     }
+
+    var isApp: Bool {
+        if case .app = self { return true }
+        return false
+    }
+
+    var stableID: StableID {
+        switch self {
+        case .window(let window): .window(window.id)
+        case .app(let app): .app(app.id)
+        }
+    }
+
+    func hasSameContent(as other: SearchPaletteItem) -> Bool {
+        switch (self, other) {
+        case let (.window(a), .window(b)):
+            return a.id == b.id && a.title == b.title && a.process == b.process &&
+                a.width == b.width && a.height == b.height && a.monitorId == b.monitorId &&
+                a.icon == b.icon
+        case let (.app(a), .app(b)):
+            return a.id == b.id && a.name == b.name && a.cmd == b.cmd &&
+                a.icon == b.icon && a.process == b.process
+        default:
+            return false
+        }
+    }
+
+    enum StableID: Hashable {
+        case window(Int64)
+        case app(String)
+    }
 }
 
 /// Paleta de busca rápida estilo Spotlight (⌘K) para alternar janelas, monitores e lançar aplicativos.
@@ -44,10 +75,12 @@ final class QuickSearchPalette: NSView, NSSearchFieldDelegate {
     private let searchField = NSSearchField()
     private let scrollView = NSScrollView()
     private let stackView = NSStackView()
+    private let backdrop = Glass.panel(cornerRadius: 16)
 
     private var allItems: [SearchPaletteItem] = []
     private var filteredItems: [SearchPaletteItem] = []
     private var selectedIndex: Int = 0
+    private var itemRows: [PaletteRowView] = []
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -59,18 +92,16 @@ final class QuickSearchPalette: NSView, NSSearchFieldDelegate {
     }
 
     private func setupUI() {
-        wantsLayer = true
-        layer?.cornerRadius = 16
-        layer?.masksToBounds = false
-        layer?.backgroundColor = NSColor(calibratedWhite: 0.12, alpha: 0.92).cgColor
-        layer?.borderWidth = 1
-        layer?.borderColor = NSColor(calibratedWhite: 0.3, alpha: 0.6).cgColor
-        layer?.shadowColor = NSColor.black.cgColor
-        layer?.shadowOpacity = 0.45
-        layer?.shadowOffset = CGSize(width: 0, height: -6)
-        layer?.shadowRadius = 18
+        backdrop.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(backdrop, positioned: .below, relativeTo: nil)
+        NSLayoutConstraint.activate([
+            backdrop.leadingAnchor.constraint(equalTo: leadingAnchor),
+            backdrop.trailingAnchor.constraint(equalTo: trailingAnchor),
+            backdrop.topAnchor.constraint(equalTo: topAnchor),
+            backdrop.bottomAnchor.constraint(equalTo: bottomAnchor)
+        ])
 
-        searchField.placeholderString = "Buscar janela ou lançar aplicativo... (⌘K)"
+        searchField.placeholderString = "Buscar janela ou aplicativo... (⌘K)"
         searchField.font = .systemFont(ofSize: 15, weight: .medium)
         searchField.focusRingType = .none
         searchField.isBordered = false
@@ -119,13 +150,55 @@ final class QuickSearchPalette: NSView, NSSearchFieldDelegate {
     }
 
     func show(with windows: [RemoteWindow], apps: [RemoteApp] = []) {
-        var items: [SearchPaletteItem] = windows.map { .window($0) }
-        items.append(contentsOf: apps.map { .app($0) })
-        allItems = items
         searchField.stringValue = ""
         selectedIndex = 0
-        applyFilter()
+        scrollView.contentView.scroll(to: .zero)
+        update(with: windows, apps: apps, preserveState: false)
         window?.makeFirstResponder(searchField)
+    }
+
+    /// Atualiza catálogo e janelas sem fechar a paleta nem perder busca, seleção ou posição.
+    func update(with windows: [RemoteWindow], apps: [RemoteApp]) {
+        update(with: windows, apps: apps, preserveState: true)
+    }
+
+    private func update(with windows: [RemoteWindow], apps: [RemoteApp], preserveState: Bool) {
+        var items: [SearchPaletteItem] = windows.map { .window($0) }
+        items.append(contentsOf: apps.map { .app($0) })
+        if preserveState && itemsEqual(allItems, items) { return }
+
+        let selectedID = filteredItems.indices.contains(selectedIndex)
+            ? filteredItems[selectedIndex].stableID : nil
+        let scrollOrigin = scrollView.contentView.bounds.origin
+        let oldFilteredItems = filteredItems
+        allItems = items
+        filteredItems = filteredItems(matching: searchField.stringValue)
+        if let selectedID, let index = filteredItems.firstIndex(where: { $0.stableID == selectedID }) {
+            selectedIndex = index
+        } else if filteredItems.isEmpty {
+            selectedIndex = 0
+        } else {
+            selectedIndex = min(max(selectedIndex, 0), filteredItems.count - 1)
+        }
+        guard !preserveState || !itemsEqual(oldFilteredItems, filteredItems) else { return }
+        rebuildList()
+        if preserveState {
+            layoutSubtreeIfNeeded()
+            scrollView.contentView.scroll(to: scrollOrigin)
+            scrollView.reflectScrolledClipView(scrollView.contentView)
+            selectedIndex = itemRows.isEmpty ? 0 : min(max(selectedIndex, 0), itemRows.count - 1)
+            updateSelectionHighlight()
+            scrollSelectedRowToVisibleIfNeeded()
+        } else {
+            scrollView.contentView.scroll(to: .zero)
+            scrollView.reflectScrolledClipView(scrollView.contentView)
+        }
+    }
+
+    private func itemsEqual(_ lhs: [SearchPaletteItem], _ rhs: [SearchPaletteItem]) -> Bool {
+        lhs.count == rhs.count && zip(lhs, rhs).allSatisfy { pair in
+            pair.0.hasSameContent(as: pair.1)
+        }
     }
 
     func controlTextDidChange(_ obj: Notification) {
@@ -142,6 +215,7 @@ final class QuickSearchPalette: NSView, NSSearchFieldDelegate {
             if !filteredItems.isEmpty {
                 selectedIndex = min(filteredItems.count - 1, selectedIndex + 1)
                 updateSelectionHighlight()
+                scrollSelectedRowToVisible()
             }
             return true
         }
@@ -149,6 +223,7 @@ final class QuickSearchPalette: NSView, NSSearchFieldDelegate {
             if !filteredItems.isEmpty {
                 selectedIndex = max(0, selectedIndex - 1)
                 updateSelectionHighlight()
+                scrollSelectedRowToVisible()
             }
             return true
         }
@@ -169,18 +244,50 @@ final class QuickSearchPalette: NSView, NSSearchFieldDelegate {
     }
 
     private func applyFilter() {
-        let query = searchField.stringValue.trimmingCharacters(in: .whitespaces).lowercased()
-        if query.isEmpty {
-            filteredItems = allItems
+        applyFilter(preserving: nil)
+    }
+
+    private func applyFilter(preserving selectedID: SearchPaletteItem.StableID?) {
+        filteredItems = filteredItems(matching: searchField.stringValue)
+        if let selectedID, let index = filteredItems.firstIndex(where: { $0.stableID == selectedID }) {
+            selectedIndex = index
+        } else if filteredItems.isEmpty {
+            selectedIndex = 0
         } else {
-            filteredItems = allItems.filter {
-                $0.title.lowercased().contains(query) || $0.subtitle.lowercased().contains(query)
-            }
+            selectedIndex = min(max(selectedIndex, 0), filteredItems.count - 1)
         }
         rebuildList()
     }
 
+    private func filteredItems(matching queryText: String) -> [SearchPaletteItem] {
+        let query = queryText.trimmingCharacters(in: .whitespaces).lowercased()
+        if query.isEmpty {
+            return allItems
+        }
+        return allItems.filter {
+            $0.title.lowercased().contains(query) || $0.subtitle.lowercased().contains(query)
+        }
+    }
+
+    private func scrollSelectedRowToVisibleIfNeeded() {
+        guard itemRows.indices.contains(selectedIndex) else { return }
+        layoutSubtreeIfNeeded()
+        let row = itemRows[selectedIndex]
+        let rowRect = row.convert(row.bounds, to: scrollView.contentView)
+        guard !scrollView.contentView.bounds.contains(rowRect) else { return }
+        scrollSelectedRowToVisible()
+    }
+
+    private func scrollSelectedRowToVisible() {
+        guard itemRows.indices.contains(selectedIndex) else { return }
+        layoutSubtreeIfNeeded()
+        let row = itemRows[selectedIndex]
+        _ = row.scrollToVisible(row.bounds)
+        scrollView.reflectScrolledClipView(scrollView.contentView)
+    }
+
     private func rebuildList() {
+        itemRows.removeAll()
         for sub in stackView.arrangedSubviews {
             stackView.removeArrangedSubview(sub)
             sub.removeFromSuperview()
@@ -194,8 +301,19 @@ final class QuickSearchPalette: NSView, NSSearchFieldDelegate {
             return
         }
 
+        var previousGroup: Int?
         for (idx, item) in filteredItems.enumerated() {
+            let group = item.isApp ? 1 : 0
+            if previousGroup != group {
+                let heading = NSTextField(labelWithString: group == 0 ? "Abertos agora" : "Aplicativos instalados")
+                heading.font = .systemFont(ofSize: 11, weight: .semibold)
+                heading.textColor = .secondaryLabelColor
+                stackView.addArrangedSubview(heading)
+                heading.leadingAnchor.constraint(equalTo: stackView.leadingAnchor, constant: 8).isActive = true
+                previousGroup = group
+            }
             let row = createRow(item: item, isSelected: idx == selectedIndex)
+            itemRows.append(row)
             stackView.addArrangedSubview(row)
             row.leadingAnchor.constraint(equalTo: stackView.leadingAnchor).isActive = true
             row.trailingAnchor.constraint(equalTo: stackView.trailingAnchor).isActive = true
@@ -203,11 +321,7 @@ final class QuickSearchPalette: NSView, NSSearchFieldDelegate {
     }
 
     private func updateSelectionHighlight() {
-        for (idx, view) in stackView.arrangedSubviews.enumerated() {
-            if let row = view as? PaletteRowView {
-                row.setSelected(idx == selectedIndex)
-            }
-        }
+        for (idx, row) in itemRows.enumerated() { row.setSelected(idx == selectedIndex) }
     }
 
     private func createRow(item: SearchPaletteItem, isSelected: Bool) -> PaletteRowView {
@@ -231,6 +345,7 @@ private final class PaletteRowView: NSView {
     private let titleLabel = NSTextField(labelWithString: "")
     private let subtitleLabel = NSTextField(labelWithString: "")
     private let iconImageView = NSImageView()
+    private var isSelected = false
 
     init(item: SearchPaletteItem, isSelected: Bool) {
         super.init(frame: .zero)
@@ -242,6 +357,7 @@ private final class PaletteRowView: NSView {
     private func setup(item: SearchPaletteItem, isSelected: Bool) {
         wantsLayer = true
         layer?.cornerRadius = 8
+        layer?.masksToBounds = true
         translatesAutoresizingMaskIntoConstraints = false
         heightAnchor.constraint(equalToConstant: 40).isActive = true
 
@@ -290,18 +406,52 @@ private final class PaletteRowView: NSView {
             subtitleLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10)
         ])
 
+        setAccessibilityElement(true)
+        setAccessibilityRole(.button)
+        setAccessibilityLabel(item.title)
+        setAccessibilityHelp(item.subtitle)
         setSelected(isSelected)
     }
 
     func setSelected(_ selected: Bool) {
-        if selected {
-            layer?.backgroundColor = NSColor.controlAccentColor.withAlphaComponent(0.35).cgColor
-        } else {
-            layer?.backgroundColor = .clear
+        isSelected = selected
+        setAccessibilityValue(selected ? "Selecionado" : "Não selecionado")
+        AppMotion.animate {
+            self.layer?.backgroundColor = self.isSelected
+                ? AppSettings.shared.accentColor.withAlphaComponent(0.24).cgColor
+                : (self.isHovered ? NSColor.controlBackgroundColor.withAlphaComponent(0.3).cgColor : NSColor.clear.cgColor)
         }
+    }
+
+    private var isHovered = false
+    private var tracking: NSTrackingArea?
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let tracking { removeTrackingArea(tracking) }
+        let area = NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self, userInfo: nil)
+        addTrackingArea(area)
+        tracking = area
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        isHovered = true
+        NSCursor.pointingHand.set()
+        setSelected(isSelected)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        isHovered = false
+        NSCursor.arrow.set()
+        setSelected(isSelected)
     }
 
     override func mouseDown(with event: NSEvent) {
         onClick?()
+    }
+
+    override func accessibilityPerformPress() -> Bool {
+        onClick?()
+        return true
     }
 }

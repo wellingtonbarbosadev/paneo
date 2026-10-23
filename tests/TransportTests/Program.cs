@@ -33,7 +33,7 @@ Console.WriteLine("PASS cadência de 30/60 FPS com jitter e retomada sem rajadas
 
 // O lançador só aceita os aplicativos da lista segura; comando vazio, caminho
 // arbitrário ou linha de comando composta não chegam ao Process.Start.
-var knownApps = AppLauncher.GetKnownApps();
+var knownApps = AppLauncher.GetLegacyApps();
 Check(knownApps.Count == 7, $"Lista de aplicativos inesperada: {knownApps.Count}.");
 foreach (string id in new[] { "notepad", "calc", "explorer", "mspaint", "powershell", "cmd", "edge" })
     Check(knownApps.Any(app => app.Id == id), $"Aplicativo ausente na lista: {id}.");
@@ -249,8 +249,21 @@ async Task<JsonElement> ReadJsonAsync(Stream stream)
     return document.RootElement.Clone();
 }
 
+async Task<JsonElement> ReadControlJsonAsync(Stream stream)
+{
+    for (int i = 0; i < 256; i++)
+    {
+        var frame = await ReadRawFrameAsync(stream);
+        if (frame.Kind != ProtocolV2.KindControl) continue;
+        using JsonDocument document = JsonDocument.Parse(frame.Payload);
+        return document.RootElement.Clone();
+    }
+    throw new Exception("Controle não recebido antes do limite de quadros.");
+}
+
 async Task<(TcpClient Tcp, SslStream Tls, byte[] Salt, byte[] Nonce)> StartHandshakeAsync(
-    RemoteServer target, string role, string name = "Mac", bool byteByByte = false)
+    RemoteServer target, string role, string name = "Mac", bool byteByByte = false, bool appCatalog = false,
+    long? windowId = null, bool windowCommands = false)
 {
     var (tcp, tls) = await ConnectAsync(target);
     await SendJsonAsync(tls, new Dictionary<string, object?>
@@ -258,8 +271,10 @@ async Task<(TcpClient Tcp, SslStream Tls, byte[] Salt, byte[] Nonce)> StartHands
         ["type"] = "hello",
         ["version"] = ProtocolV2.Version,
         ["role"] = role,
-        ["windowId"] = null,
-        ["clientName"] = name
+        ["windowId"] = windowId,
+        ["clientName"] = name,
+        ["appCatalog"] = appCatalog,
+        ["windowCommands"] = windowCommands
     }, byteByByte);
 
     JsonElement challenge = await ReadJsonAsync(tls);
@@ -480,6 +495,7 @@ try
     // injetado para o teste não abrir processos reais na máquina de teste.
     {
         var launched = new ConcurrentQueue<string>();
+        string installedAppId = "app-" + new string('a', 64);
         using var appServer = new RemoteServer(
             new IntPtr(1),
             IPAddress.Loopback,
@@ -512,6 +528,9 @@ try
                 await SendJsonAsync(tls, new { type = "launch", app = "notepad" });
                 for (int i = 0; i < 100 && !launched.Contains("notepad"); i++) await Task.Delay(20, ct);
                 Check(launched.Contains("notepad"), "launch não chegou ao lançador na sessão de controle.");
+                await SendJsonAsync(tls, new { type = "launch", app = installedAppId });
+                for (int i = 0; i < 100 && launched.Count(value => value == installedAppId) < 1; i++) await Task.Delay(20, ct);
+                Check(launched.Count(value => value == installedAppId) == 1, "ID opaco de 68 caracteres foi recusado no controle.");
 
                 await SendJsonAsync(tls, new { type = "ping" });
                 Check((await ReadJsonAsync(tls)).GetProperty("type").GetString() == "pong", "pong ausente após launch.");
@@ -527,9 +546,37 @@ try
                 await SendJsonAsync(viewTls, new { type = "launch", app = "calc" });
                 for (int i = 0; i < 100 && !launched.Contains("calc"); i++) await Task.Delay(20, ct);
                 Check(launched.Contains("calc"), "launch não chegou ao lançador na sessão de visualização.");
+                await SendJsonAsync(viewTls, new { type = "launch", app = installedAppId });
+                for (int i = 0; i < 100 && launched.Count(value => value == installedAppId) < 2; i++) await Task.Delay(20, ct);
+                Check(launched.Count(value => value == installedAppId) == 2, "ID opaco foi recusado na visualização.");
             }
 
-            Console.WriteLine("PASS launch chega ao lançador e a lista segura vai na mensagem windows");
+            var (catalogTcp, catalogTls, catalogSalt, catalogNonce) = await StartHandshakeAsync(appServer, "control", appCatalog: true);
+            using (catalogTcp)
+            using (catalogTls)
+            {
+                await SendPinAsync(catalogTls, Pin, catalogSalt, catalogNonce);
+                Check((await ReadJsonAsync(catalogTls)).GetProperty("type").GetString() == "ready", "ready do catálogo ausente.");
+                Check((await ReadJsonAsync(catalogTls)).GetProperty("type").GetString() == "windows", "windows do catálogo ausente.");
+                var catalogIds = new HashSet<string>(StringComparer.Ordinal);
+                int chunks = 1;
+                for (int index = 0; index < chunks; index++)
+                {
+                    JsonElement part = await ReadJsonAsync(catalogTls);
+                    Check(part.GetProperty("type").GetString() == "apps" && part.GetProperty("index").GetInt32() == index,
+                        "Catálogo não foi recebido em ordem.");
+                    chunks = part.GetProperty("total").GetInt32();
+                    Check(chunks is >= 1 and <= 4096 && Encoding.UTF8.GetByteCount(part.GetRawText()) <= ProtocolV2.MaxControlHostToClient,
+                        "Chunk do catálogo excede o contrato.");
+                    foreach (JsonElement app in part.GetProperty("apps").EnumerateArray())
+                        Check(catalogIds.Add(app.GetProperty("cmd").GetString()!), "ID duplicado no catálogo.");
+                }
+                Check(catalogIds.Count == Math.Min(4096, AppLauncher.GetKnownApps().Count), "Catálogo negociado incompleto.");
+                await SendJsonAsync(catalogTls, new { type = "ping" });
+                Check((await ReadJsonAsync(catalogTls)).GetProperty("type").GetString() == "pong", "Catálogo interrompeu o controle.");
+            }
+
+            Console.WriteLine("PASS launch legado/ID opaco nas duas sessões e catálogo negociado em chunks");
         }
         finally
         {
@@ -786,6 +833,95 @@ try
         }
     }
 
+    // WINDOWPLACEMENT em Windows não inclui rcDevice (campo exclusivo de builds
+    // de header para Mac); Get/SetWindowPlacement exigem sizeof=44.
+    {
+        Type placement = typeof(WindowCommands).GetNestedType("WINDOWPLACEMENT", System.Reflection.BindingFlags.NonPublic)!;
+        Check(System.Runtime.InteropServices.Marshal.SizeOf(placement) == 44, "WINDOWPLACEMENT deve ter 44 bytes no Windows.");
+        Check(WindowCommands.NormalizeMenuText("A&&B &File") == "A&B File", "Texto de menu deve preservar ampersand literal e remover mnemônico.");
+    }
+
+    // 6e. Negociação de controles de janela: estado, ações e snapshot de menu.
+    {
+        var fakeCommands = new FakeWindowCommands(123);
+        using var commandsServer = new RemoteServer(
+            IntPtr.Zero, IPAddress.Loopback, 0, credentials,
+            windowList: () => windowList, enableVideo: false,
+            windowCommandsFactory: (_, _) => fakeCommands);
+        commandsServer.Start();
+        var (tcp, tls, salt, nonce) = await StartHandshakeAsync(
+            commandsServer, "view", windowId: 123, windowCommands: true);
+        using (tcp)
+        using (tls)
+        {
+            await SendPinAsync(tls, Pin, salt, nonce);
+            Check((await ReadJsonAsync(tls)).GetProperty("type").GetString() == "ready", "ready ausente nos controles de janela.");
+            JsonElement initial = await ReadControlJsonAsync(tls);
+            Check(initial.GetProperty("type").GetString() == "windowState" && initial.GetProperty("windowId").GetInt64() == 123,
+                "Estado inicial da janela ausente ou com HWND incorreto.");
+
+            await SendJsonAsync(tls, new { type = "windowAction", action = "reading", enabled = true, width = 800, height = 600 });
+            JsonElement readingResult = await ReadControlJsonAsync(tls);
+            JsonElement readingState = await ReadControlJsonAsync(tls);
+            Check(readingResult.GetProperty("type").GetString() == "windowCommandResult" && readingResult.GetProperty("success").GetBoolean(),
+                "Ativação de leitura não foi confirmada.");
+            Check(readingState.GetProperty("reading").GetBoolean(), "Estado de leitura não foi atualizado.");
+
+            await SendJsonAsync(tls, new { type = "windowMenus" });
+            JsonElement menus = await ReadControlJsonAsync(tls);
+            Check(menus.GetProperty("type").GetString() == "windowMenus" && menus.GetProperty("supported").GetBoolean(),
+                "Resposta de menus ausente.");
+            await SendJsonAsync(tls, new { type = "windowMenuInvoke", id = "fake:1" });
+            JsonElement menuResult = await ReadControlJsonAsync(tls);
+            Check(menuResult.GetProperty("type").GetString() == "windowCommandResult" && menuResult.GetProperty("success").GetBoolean(),
+                "Invocação de menu não foi confirmada.");
+
+            await SendJsonAsync(tls, new { type = "windowAction", action = "maximize" });
+            JsonElement maximizeResult = await ReadControlJsonAsync(tls);
+            JsonElement maximizeState = await ReadControlJsonAsync(tls);
+            Check(maximizeResult.GetProperty("success").GetBoolean() && maximizeState.GetProperty("maximized").GetBoolean()
+                && !maximizeState.GetProperty("reading").GetBoolean(), "Maximizar não encerrou leitura antes da ação.");
+            Console.WriteLine("PASS windowCommands negociados publicam estado, menus e resultados de ação");
+        }
+        await commandsServer.StopAsync();
+    }
+
+    // 6f. Menus maiores que o limite viram fallback sem encerrar a sessão view.
+    {
+        var largeItems = Enumerable.Range(0, 128)
+            .Select(index => new RemoteWindowMenuItem("large:" + index, new string('界', 128), true, false, false, []))
+            .ToArray();
+        Check(JsonSerializer.SerializeToUtf8Bytes(largeItems).Length > ProtocolV2.MaxControlHostToClient,
+            "Fixture de menu grande não ultrapassa o limite JSON do protocolo.");
+        var fakeCommands = new FakeWindowCommands(123, new RemoteWindowMenus(true, largeItems));
+        using var commandsServer = new RemoteServer(
+            IntPtr.Zero, IPAddress.Loopback, 0, credentials,
+            windowList: () => windowList, enableVideo: false,
+            windowCommandsFactory: (_, _) => fakeCommands);
+        commandsServer.Start();
+        var (tcp, tls, salt, nonce) = await StartHandshakeAsync(
+            commandsServer, "view", windowId: 123, windowCommands: true);
+        using (tcp)
+        using (tls)
+        {
+            await SendPinAsync(tls, Pin, salt, nonce);
+            Check((await ReadJsonAsync(tls)).GetProperty("type").GetString() == "ready", "ready ausente no menu grande.");
+            _ = await ReadControlJsonAsync(tls); // windowState
+            await SendJsonAsync(tls, new { type = "windowMenus" });
+            JsonElement menus = await ReadControlJsonAsync(tls);
+            Check(menus.GetProperty("type").GetString() == "windowMenus"
+                && !menus.GetProperty("supported").GetBoolean()
+                && menus.GetProperty("items").GetArrayLength() == 0
+                && !string.IsNullOrWhiteSpace(menus.GetProperty("reason").GetString()),
+                "Menu acima do limite não retornou fallback curto.");
+            await SendJsonAsync(tls, new { type = "ping" });
+            Check((await ReadControlJsonAsync(tls)).GetProperty("type").GetString() == "pong",
+                "Sessão encerrou após fallback de menu grande.");
+            Console.WriteLine("PASS menu grande retorna unsupported sem encerrar a sessão view");
+        }
+        await commandsServer.StopAsync();
+    }
+
     // 7. Mídia PNG: codec 3, seq crescente e tamanho correto.
     {
         var (tcp, tls, _, nonce) = await StartHandshakeAsync(server, "view");
@@ -825,6 +961,7 @@ try
         }
         else
         {
+            WindowProbe.Capture.ContinuousWindowCapture.RawSize = (640, 360);
             using var videoServer = new RemoteServer(
                 new IntPtr(1),
                 IPAddress.Loopback,
@@ -842,6 +979,10 @@ try
                 await SendPinAsync(tls, Pin, salt, nonce);
                 Check((await ReadJsonAsync(tls)).GetProperty("type").GetString() == "ready", "ready ausente no modo view de vídeo.");
 
+                JsonElement viewport = await ReadJsonAsync(tls);
+                Check(viewport.GetProperty("type").GetString() == "viewport" &&
+                      viewport.GetProperty("width").GetInt32() == 640 && viewport.GetProperty("height").GetInt32() == 360,
+                      "Viewport inicial não representa os pixels ativos.");
                 JsonElement video = await ReadJsonAsync(tls);
                 Check(video.GetProperty("type").GetString() == "video", "Mensagem 'video' ausente antes do quadro.");
                 Check(video.GetProperty("codec").GetString() == "h264", "Codec anunciado diferente de h264.");
@@ -849,10 +990,31 @@ try
                 var frame = await ReadRawFrameAsync(tls);
                 Check(frame.Kind == ProtocolV2.KindMedia, "Esperava mídia de vídeo.");
                 Check(frame.Codec == ProtocolV2.CodecH264, "Esperava codec H.264 (1).");
-                Check(frame.Width == 320 && frame.Height == 240, "Dimensões do frame de vídeo inesperadas.");
+                Check(frame.Width == 640 && frame.Height == 368, "Padding inicial do frame de vídeo inesperado.");
                 Check(frame.Payload.Length > 0, "Frame de vídeo vazio.");
-                Console.WriteLine("PASS pipeline de vídeo entrega H.264 com codec, dimensões e payload");
+
+                await SendJsonAsync(tls, new { type = "quality", fps = 30, bitrate = 3_000_000, maxDimension = 320 });
+                bool scaledViewport = false, scaledVideo = false, scaledMedia = false;
+                for (int i = 0; i < 60 && !scaledMedia; i++)
+                {
+                    var next = await ReadRawFrameAsync(tls);
+                    if (next.Kind == ProtocolV2.KindControl)
+                    {
+                        using var message = JsonDocument.Parse(next.Payload);
+                        JsonElement root = message.RootElement;
+                        if (root.GetProperty("type").GetString() == "viewport")
+                            scaledViewport = root.GetProperty("width").GetInt32() == 320 && root.GetProperty("height").GetInt32() == 180;
+                        if (root.GetProperty("type").GetString() == "video")
+                            scaledVideo = root.GetProperty("width").GetInt32() == 320 && root.GetProperty("height").GetInt32() == 192
+                                && root.GetProperty("maxDimension").GetBoolean();
+                    }
+                    else if (next.Width == 320 && next.Height == 192 && next.Codec == ProtocolV2.CodecH264)
+                        scaledMedia = true;
+                }
+                Check(scaledViewport && scaledVideo && scaledMedia, "Mudança de resolução não atualizou viewport, anúncio e mídia H.264.");
+                Console.WriteLine("PASS H.264 e redução real de resolução com viewport ativo e padding");
             }
+            WindowProbe.Capture.ContinuousWindowCapture.RawSize = (320, 240);
         }
     }
 

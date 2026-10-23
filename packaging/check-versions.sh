@@ -41,9 +41,15 @@ else
 	err "Info.plist.in nao referencia @VERSION@"
 fi
 if grep -q '<string>RemoteDesktop</string>' "$plist" && grep -q '<key>CFBundleExecutable</key>' "$plist"; then
-	ok "Info.plist.in: bundle RemoteDesktop com executavel RemoteDesktop"
+	ok "Info.plist.in: executavel RemoteDesktop preservado"
 else
-	err "Info.plist.in: executavel/bundle RemoteDesktop inconsistente"
+	err "Info.plist.in: executavel RemoteDesktop inconsistente"
+fi
+if grep -A 1 '<key>CFBundleDisplayName</key>' "$plist" | grep -q '<string>Paneo</string>' &&
+   grep -A 1 '<key>CFBundleName</key>' "$plist" | grep -q '<string>Paneo</string>'; then
+	ok "Info.plist.in: nome visivel Paneo"
+else
+	err "Info.plist.in: nome visivel diferente de Paneo"
 fi
 if grep -q '<string>dev.remotedesktop.client</string>' "$plist"; then
 	ok "Info.plist.in: CFBundleIdentifier dev.remotedesktop.client"
@@ -80,10 +86,10 @@ if [ "$iss_version" = "$version" ]; then
 else
 	err ".iss MyAppVersion = '$iss_version', esperado '$version'"
 fi
-if grep -qF '#define MyAppName "remoteDesktop Host"' "$iss"; then
-	ok ".iss MyAppName = remoteDesktop Host"
+if grep -qF '#define MyAppName "Paneo Host"' "$iss"; then
+	ok ".iss MyAppName = Paneo Host"
 else
-	err ".iss MyAppName diferente de 'remoteDesktop Host'"
+	err ".iss MyAppName diferente de 'Paneo Host'"
 fi
 if grep -q 'PrivilegesRequired=lowest' "$iss"; then
 	ok ".iss PrivilegesRequired=lowest (instalacao por usuario, sem administracao)"
@@ -95,8 +101,8 @@ if grep -qF 'DefaultDirName={localappdata}\Programs\remoteDesktop' "$iss"; then
 else
 	err ".iss: DefaultDirName nao esta em {localappdata}"
 fi
-if grep -qF 'WindowProbe.exe' "$iss" && grep -qF 'OutputBaseFilename=remoteDesktop-host-{#MyAppVersion}-win-x64-setup' "$iss"; then
-	ok ".iss: exe WindowProbe.exe e nome de saida remoteDesktop-host-<versao>-win-x64-setup"
+if grep -qF 'WindowProbe.exe' "$iss" && grep -qF 'OutputBaseFilename=Paneo-host-{#MyAppVersion}-win-x64-setup' "$iss"; then
+	ok ".iss: exe WindowProbe.exe e nome de saida Paneo-host-<versao>-win-x64-setup"
 else
 	err ".iss: WindowProbe.exe ou OutputBaseFilename inconsistente"
 fi
@@ -134,10 +140,10 @@ if grep -q "$version" "$doc"; then
 else
 	err "docs/INSTALLERS.md nao menciona a versao $version"
 fi
-if grep -q 'RemoteDesktop.app' "$doc" && grep -q 'WindowProbe.exe' "$doc"; then
-	ok "docs/INSTALLERS.md documenta RemoteDesktop.app e WindowProbe.exe"
+if grep -q 'Paneo.app' "$doc" && grep -q 'WindowProbe.exe' "$doc"; then
+	ok "docs/INSTALLERS.md documenta Paneo.app e WindowProbe.exe"
 else
-	err "docs/INSTALLERS.md sem RemoteDesktop.app ou WindowProbe.exe"
+	err "docs/INSTALLERS.md sem Paneo.app ou WindowProbe.exe"
 fi
 
 if [ "$fail_count" -gt 0 ]; then

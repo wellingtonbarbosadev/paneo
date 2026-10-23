@@ -178,4 +178,7 @@ public sealed record WindowDescriptor(
     string Process,
     int Width,
     int Height,
-    string? IconBase64 = null);
+    string? IconBase64 = null,
+    uint ProcessId = 0,
+    bool Minimized = false,
+    bool CanResize = false);

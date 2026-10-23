@@ -114,6 +114,12 @@ internal static class NativeMethods
 
     internal static bool TryGetWindowSize(IntPtr hwnd, out int width, out int height)
     {
+        if (GetWindowPlacement(hwnd, out WINDOWPLACEMENT placement))
+        {
+            width = Math.Max(0, placement.NormalPosition.Right - placement.NormalPosition.Left);
+            height = Math.Max(0, placement.NormalPosition.Bottom - placement.NormalPosition.Top);
+            if (width > 0 && height > 0) return true;
+        }
         if (GetWindowRect(hwnd, out RECT rect))
         {
             width = Math.Max(0, rect.Right - rect.Left);
@@ -125,6 +131,36 @@ internal static class NativeMethods
         height = 0;
         return false;
     }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct WINDOWPLACEMENT
+    {
+        public uint Length, Flags, ShowCmd;
+        public POINT MinPosition, MaxPosition;
+        public RECT NormalPosition;
+    }
+
+    [StructLayout(LayoutKind.Sequential)] private struct POINT { public int X, Y; }
+
+    [DllImport("user32.dll", EntryPoint = "GetWindowPlacement", SetLastError = true)]
+    private static extern bool GetWindowPlacementNative(IntPtr hwnd, ref WINDOWPLACEMENT placement);
+
+    private static bool GetWindowPlacement(IntPtr hwnd, out WINDOWPLACEMENT placement)
+    {
+        placement = new WINDOWPLACEMENT { Length = (uint)Marshal.SizeOf<WINDOWPLACEMENT>() };
+        return GetWindowPlacementNative(hwnd, ref placement);
+    }
+
+    internal static bool CanResizeWindow(IntPtr hwnd) => (GetWindowLongPtr(hwnd, -16).ToInt64() & 0x00040000) != 0;
+    private static IntPtr GetWindowLongPtr(IntPtr hwnd, int index) => IntPtr.Size == 8
+        ? GetWindowLongPtr64(hwnd, index)
+        : new IntPtr(GetWindowLong32(hwnd, index));
+
+    [DllImport("user32.dll", EntryPoint = "GetWindowLongW", SetLastError = true)]
+    private static extern int GetWindowLong32(IntPtr hwnd, int index);
+
+    [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW", SetLastError = true)]
+    private static extern IntPtr GetWindowLongPtr64(IntPtr hwnd, int index);
 }
 
 /// <summary>

@@ -7,7 +7,9 @@ public sealed record WindowInfo(
     string Title,
     int Width,
     int Height,
-    string? IconBase64 = null)
+    string? IconBase64 = null,
+    bool Minimized = false,
+    bool CanResize = false)
 {
     public string HandleText => $"0x{Handle.ToInt64():X}";
 

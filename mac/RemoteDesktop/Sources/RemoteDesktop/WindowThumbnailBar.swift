@@ -4,7 +4,7 @@ import AppKit
 @MainActor
 final class ThumbnailCardView: NSView {
 
-    let target: RemoteWindow
+    private(set) var target: RemoteWindow
     var onClick: (() -> Void)?
     var onDetach: (() -> Void)?
 
@@ -13,34 +13,51 @@ final class ThumbnailCardView: NSView {
     }
 
     var thumbnailImage: NSImage? {
-        didSet {
-            previewView.image = thumbnailImage
-            previewView.isHidden = thumbnailImage == nil
-            placeholderView.isHidden = thumbnailImage != nil
-        }
+        didSet { updateThumbnailVisibility() }
+    }
+
+    private var density: BarDensity = .large
+
+    private func updateThumbnailVisibility() {
+        previewView.image = thumbnailImage
+        let showPreview = density != .icons && thumbnailImage != nil
+        previewView.isHidden = !showPreview
+        placeholderView.isHidden = showPreview
     }
 
     private let previewView = NSImageView()
     private let placeholderView = NSStackView()
     private let titleLabel = NSTextField(labelWithString: "")
     private let processLabel = NSTextField(labelWithString: "")
+    private let bottomBar = NSView()
+    private var bottomBarHeight: NSLayoutConstraint!
     private var isHovered: Bool = false
+    private var isPointerInside = false
     private var tracking: NSTrackingArea?
     private let detachButton = NSButton()
     private let badgeView = NSTextField(labelWithString: "")
+    private var widthConstraint: NSLayoutConstraint!
+    private var heightConstraint: NSLayoutConstraint!
     var onToggleFavorite: (() -> Void)?
     var isFavorite: Bool = false {
-        didSet { updateAppearance() }
+        didSet {
+            setAccessibilityLabel("\(target.title.isEmpty ? target.process : target.title), \(target.process)\(isFavorite ? ", favorito" : "")")
+            updateAppearance()
+        }
     }
 
-    init(target: RemoteWindow) {
+    init(target: RemoteWindow, size: NSSize = NSSize(width: 160, height: 96)) {
         self.target = target
-        super.init(frame: NSRect(x: 0, y: 0, width: 160, height: 96))
+        super.init(frame: NSRect(origin: .zero, size: size))
         wantsLayer = true
         layer?.cornerRadius = 12
         layer?.masksToBounds = true
 
         toolTip = "\(target.process) — \(target.title.isEmpty ? target.process : target.title)\n\(target.width)×\(target.height)"
+        setAccessibilityElement(true)
+        setAccessibilityRole(.button)
+        setAccessibilityLabel("\(target.title.isEmpty ? target.process : target.title), \(target.process)\(target.minimized ? ", minimizada no Windows" : "")")
+        setAccessibilityHelp("Pressione Return para selecionar esta janela.")
 
         // Visual da prévia (imagem capturada)
         previewView.imageScaling = .scaleProportionallyUpOrDown
@@ -66,15 +83,14 @@ final class ThumbnailCardView: NSView {
         addSubview(placeholderView)
 
         // Faixa de título no rodapé do card
-        let bottomBar = NSView()
         bottomBar.wantsLayer = true
-        bottomBar.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.65).cgColor
+        bottomBar.layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.78).cgColor
         bottomBar.translatesAutoresizingMaskIntoConstraints = false
         addSubview(bottomBar)
 
         titleLabel.stringValue = target.title.isEmpty ? target.process : target.title
         titleLabel.font = .systemFont(ofSize: 11, weight: .semibold)
-        titleLabel.textColor = .white
+        titleLabel.textColor = .labelColor
         titleLabel.lineBreakMode = .byTruncatingTail
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
         bottomBar.addSubview(titleLabel)
@@ -83,7 +99,7 @@ final class ThumbnailCardView: NSView {
         detachButton.image = NSImage(systemSymbolName: "arrow.up.forward.app",
                                      accessibilityDescription: "Destacar em janela")
         detachButton.isBordered = false
-        detachButton.contentTintColor = .white
+        detachButton.contentTintColor = .labelColor
         detachButton.toolTip = target.isAllMonitors
             ? "Abrir cada monitor em uma janela do Mac"
             : "Destacar em janela separada do macOS"
@@ -108,14 +124,21 @@ final class ThumbnailCardView: NSView {
         if let badge = target.badge {
             badgeView.stringValue = badge == "•" ? "  •  " : " \(badge) "
             badgeView.isHidden = false
+        } else if target.minimized {
+            badgeView.stringValue = " Ⅱ "
+            badgeView.layer?.backgroundColor = NSColor.secondaryLabelColor.cgColor
+            badgeView.isHidden = false
         } else {
             badgeView.isHidden = true
         }
         addSubview(badgeView, positioned: .above, relativeTo: nil)
 
+        widthConstraint = widthAnchor.constraint(equalToConstant: size.width)
+        heightConstraint = heightAnchor.constraint(equalToConstant: size.height)
+        bottomBarHeight = bottomBar.heightAnchor.constraint(equalToConstant: 26)
         NSLayoutConstraint.activate([
-            widthAnchor.constraint(equalToConstant: 160),
-            heightAnchor.constraint(equalToConstant: 96),
+            widthConstraint,
+            heightConstraint,
 
             badgeView.topAnchor.constraint(equalTo: topAnchor, constant: 5),
             badgeView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 6),
@@ -140,7 +163,7 @@ final class ThumbnailCardView: NSView {
             bottomBar.leadingAnchor.constraint(equalTo: leadingAnchor),
             bottomBar.trailingAnchor.constraint(equalTo: trailingAnchor),
             bottomBar.bottomAnchor.constraint(equalTo: bottomAnchor),
-            bottomBar.heightAnchor.constraint(equalToConstant: 26),
+            bottomBarHeight,
 
             titleLabel.leadingAnchor.constraint(equalTo: bottomBar.leadingAnchor, constant: 8),
             titleLabel.trailingAnchor.constraint(equalTo: bottomBar.trailingAnchor, constant: -8),
@@ -151,6 +174,18 @@ final class ThumbnailCardView: NSView {
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) não suportado.") }
+
+    override var acceptsFirstResponder: Bool { true }
+
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 36 || event.keyCode == 76 { onClick?() }
+        else { super.keyDown(with: event) }
+    }
+
+    override func accessibilityPerformPress() -> Bool {
+        onClick?()
+        return true
+    }
 
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
@@ -165,6 +200,51 @@ final class ThumbnailCardView: NSView {
 
     @objc private func didClickDetach() { onDetach?() }
     @objc private func didClickToggleFavorite() { onToggleFavorite?() }
+
+    func update(target: RemoteWindow) {
+        self.target = target
+        titleLabel.stringValue = "\(target.minimized ? "Ⅱ " : "")\(target.title.isEmpty ? target.process : target.title)"
+        processLabel.stringValue = target.process
+        setAccessibilityLabel("\(target.title.isEmpty ? target.process : target.title), \(target.process)\(target.minimized ? ", minimizada no Windows" : "")\(isFavorite ? ", favorito" : "")")
+        toolTip = "\(target.process) — \(target.title.isEmpty ? target.process : target.title)\n\(target.width)×\(target.height)\(target.minimized ? " · Minimizada no Windows" : "")"
+        if let badge = target.badge {
+            badgeView.stringValue = badge == "•" ? "  •  " : " \(badge) "
+            badgeView.layer?.backgroundColor = NSColor.systemRed.cgColor
+            badgeView.isHidden = false
+        } else if target.minimized {
+            badgeView.stringValue = " Ⅱ "
+            badgeView.layer?.backgroundColor = NSColor.secondaryLabelColor.cgColor
+            badgeView.isHidden = false
+        } else {
+            badgeView.isHidden = true
+        }
+        detachButton.toolTip = target.isAllMonitors
+            ? "Abrir cada monitor em uma janela do Mac"
+            : "Destacar em janela separada do macOS"
+    }
+
+    func configure(density: BarDensity) {
+        self.density = density
+        let size: NSSize
+        switch density {
+        case .large: size = NSSize(width: 160, height: 96)
+        case .compact: size = NSSize(width: 116, height: 76)
+        case .icons: size = NSSize(width: 58, height: 58)
+        }
+        widthConstraint.constant = size.width
+        heightConstraint.constant = size.height
+        bottomBarHeight.constant = density == .icons ? 0 : 26
+        titleLabel.isHidden = density == .icons
+        bottomBar.isHidden = density == .icons
+        processLabel.isHidden = density != .large
+        placeholderView.spacing = density == .large ? 4 : 2
+        updateThumbnailVisibility()
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        updateAppearance()
+    }
 
     override func menu(for event: NSEvent) -> NSMenu? {
         let menu = NSMenu()
@@ -184,14 +264,16 @@ final class ThumbnailCardView: NSView {
 
     override func mouseEntered(with event: NSEvent) {
         isHovered = true
-        detachButton.isHidden = false
+        isPointerInside = true
+        AppMotion.setVisible(detachButton, true)
         NSCursor.pointingHand.set()
         updateAppearance()
     }
 
     override func mouseExited(with event: NSEvent) {
         isHovered = false
-        detachButton.isHidden = true
+        isPointerInside = false
+        AppMotion.setVisible(detachButton, false)
         NSCursor.arrow.set()
         updateAppearance()
     }
@@ -199,27 +281,35 @@ final class ThumbnailCardView: NSView {
     override func mouseUp(with event: NSEvent) {
         let location = convert(event.locationInWindow, from: nil)
         if bounds.contains(location) {
+            window?.makeFirstResponder(self)
             onClick?()
         }
     }
 
     private func updateAppearance() {
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        if isSelected {
-            layer?.borderColor = NSColor.controlAccentColor.cgColor
-            layer?.borderWidth = 2.5
-            layer?.backgroundColor = NSColor.controlAccentColor.withAlphaComponent(0.2).cgColor
-        } else if isHovered {
-            layer?.borderColor = NSColor.labelColor.withAlphaComponent(0.5).cgColor
-            layer?.borderWidth = 1.5
-            layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.25).cgColor
-        } else {
-            layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.3).cgColor
-            layer?.borderWidth = 1.0
-            layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.12).cgColor
+        let accent = AppSettings.shared.accentColor
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            titleLabel.textColor = .labelColor
+            processLabel.textColor = .secondaryLabelColor
+            detachButton.contentTintColor = .labelColor
+            bottomBar.layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.78).cgColor
+            AppMotion.animate {
+                if self.isSelected {
+                    self.layer?.borderColor = accent.cgColor
+                    self.layer?.borderWidth = 2.5
+                    self.layer?.backgroundColor = accent.withAlphaComponent(0.22).cgColor
+                } else if self.isHovered {
+                    self.layer?.borderColor = NSColor.labelColor.withAlphaComponent(0.42).cgColor
+                    self.layer?.borderWidth = 1.5
+                    self.layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.32).cgColor
+                } else {
+                    self.layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.34).cgColor
+                    self.layer?.borderWidth = 1
+                    self.layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.18).cgColor
+                }
+                self.layer?.transform = CATransform3DMakeScale(self.isPointerInside ? 1.015 : 1, self.isPointerInside ? 1.015 : 1, 1)
+            }
         }
-        CATransaction.commit()
     }
 
     private static func makeAppIconView(for target: RemoteWindow) -> NSView {
@@ -329,210 +419,373 @@ final class ThumbnailCardView: NSView {
     }
 }
 
-/// Barra horizontal com efeito translúcido (Header) exibindo as miniaturas dos apps do Windows.
+/// Barra configurável exibindo favoritos e miniaturas dos apps do Windows.
 @MainActor
 final class WindowThumbnailBar: NSView {
-
     var onSelectWindow: ((RemoteWindow) -> Void)?
     var onRefresh: (() -> Void)?
     var onDisconnect: (() -> Void)?
     var onDetachWindow: ((RemoteWindow) -> Void)?
     var onCollapse: (() -> Void)?
-    /// Mouse entrou/saiu da barra (usado para recolher de novo depois de espiar).
     var onHoverChanged: ((Bool) -> Void)?
+    var onActivateFavorite: ((FavoriteApp, NSView) -> Void)?
+    var onOpenApps: (() -> Void)?
+    var onShowQuality: ((NSView) -> Void)?
 
+    var favoriteStore = FavoriteAppStore.shared
+    private var hostKey = "default"
+    private var favorites: [FavoriteApp] = []
+    private var favoriteViews: [String: FavoriteAppCardView] = [:]
+    private var position: BarPosition = .top
+    private var density: BarDensity = .large
     private var hoverTracking: NSTrackingArea?
-    private let collapseButton = NSButton()
     private let panel: NSView
     private let titleBadge = NSTextField(labelWithString: "Janelas")
     private let countBadge = NSTextField(labelWithString: "0")
+    private let badgeStack: NSStackView
     private let scrollView = NSScrollView()
     private let cardsStack = NSStackView()
     private let refreshButton = NSButton()
+    private let appsButton = NSButton(title: "Apps", target: nil, action: nil)
+    private let qualityButton = NSButton(title: "Vídeo", target: nil, action: nil)
     private let disconnectButton = NSButton(title: "Desconectar", target: nil, action: nil)
-
+    private let collapseButton = NSButton()
+    private let actionsStack: NSStackView
+    private var layoutConstraints: [NSLayoutConstraint] = []
     private var cardViews: [Int64: ThumbnailCardView] = [:]
     private var cachedThumbnails: [Int64: NSImage] = [:]
     private var currentWindows: [RemoteWindow] = []
     private var selectedId: Int64?
+    private var favoritePresentation: [String: String] = [:]
+
+    var preferredThickness: CGFloat {
+        switch (position, density) {
+        case (.top, .large), (.bottom, .large): 128
+        case (.top, .compact), (.bottom, .compact): 108
+        case (.top, .icons), (.bottom, .icons): 82
+        case (.left, .large), (.right, .large): 188
+        case (.left, .compact), (.right, .compact): 144
+        case (.left, .icons), (.right, .icons): 84
+        }
+    }
 
     override init(frame frameRect: NSRect) {
         panel = Glass.panel(cornerRadius: 16)
+        badgeStack = NSStackView(views: [titleBadge, countBadge])
+        actionsStack = NSStackView(views: [collapseButton, refreshButton, appsButton, qualityButton, disconnectButton])
         super.init(frame: frameRect)
         translatesAutoresizingMaskIntoConstraints = false
-
         panel.translatesAutoresizingMaskIntoConstraints = false
         addSubview(panel)
-
-        // Título e Contador à esquerda
         titleBadge.font = .systemFont(ofSize: 12, weight: .bold)
         titleBadge.textColor = .labelColor
         countBadge.font = .monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
         countBadge.textColor = .secondaryLabelColor
-
-        let badgeStack = NSStackView(views: [titleBadge, countBadge])
-        badgeStack.orientation = .vertical
         badgeStack.spacing = 2
-        badgeStack.alignment = .leading
         badgeStack.translatesAutoresizingMaskIntoConstraints = false
         panel.addSubview(badgeStack)
 
-        // Scroll horizontal para os cards
         cardsStack.orientation = .horizontal
         cardsStack.spacing = 10
         cardsStack.alignment = .centerY
         cardsStack.translatesAutoresizingMaskIntoConstraints = false
-
         scrollView.drawsBackground = false
         scrollView.hasVerticalScroller = false
         scrollView.hasHorizontalScroller = true
         scrollView.autohidesScrollers = true
         scrollView.scrollerStyle = .overlay
-        scrollView.horizontalScrollElasticity = .allowed
-        scrollView.verticalScrollElasticity = .none
         scrollView.documentView = cardsStack
         scrollView.translatesAutoresizingMaskIntoConstraints = false
         panel.addSubview(scrollView)
 
-        // Botões de ação à direita
         refreshButton.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: "Atualizar janelas")
         refreshButton.toolTip = "Atualizar lista de janelas (Automático a cada 2s)"
         refreshButton.target = self
         refreshButton.action = #selector(didClickRefresh)
         Glass.style(refreshButton)
-
+        appsButton.image = NSImage(systemSymbolName: "square.grid.2x2", accessibilityDescription: "Aplicativos")
+        appsButton.setAccessibilityLabel("Aplicativos abertos e instalados no Windows")
+        appsButton.target = self
+        appsButton.action = #selector(didClickApps)
+        Glass.style(appsButton)
+        qualityButton.image = NSImage(systemSymbolName: "slider.horizontal.3", accessibilityDescription: "Qualidade do vídeo")
+        qualityButton.setAccessibilityLabel("Qualidade, resolução e quadros por segundo")
+        qualityButton.target = self
+        qualityButton.action = #selector(didClickQuality)
+        Glass.style(qualityButton)
         disconnectButton.target = self
         disconnectButton.action = #selector(didClickDisconnect)
         Glass.style(disconnectButton)
-
         collapseButton.image = NSImage(systemSymbolName: "chevron.up", accessibilityDescription: "Recolher lista")
-        collapseButton.toolTip = "Recolher a lista de apps (⌘⇧B). Passe o mouse no topo para reaparecer."
+        collapseButton.toolTip = "Recolher a lista de apps (⌘⇧B). Passe o mouse na borda para reaparecer."
         collapseButton.target = self
         collapseButton.action = #selector(didClickCollapse)
         Glass.style(collapseButton)
-
-        let actionsStack = NSStackView(views: [collapseButton, refreshButton, disconnectButton])
-        actionsStack.orientation = .horizontal
         actionsStack.spacing = 8
-        actionsStack.alignment = .centerY
         actionsStack.translatesAutoresizingMaskIntoConstraints = false
         panel.addSubview(actionsStack)
-
-        NSLayoutConstraint.activate([
-            heightAnchor.constraint(equalToConstant: 128),
-
-            panel.leadingAnchor.constraint(equalTo: leadingAnchor),
-            panel.trailingAnchor.constraint(equalTo: trailingAnchor),
-            panel.topAnchor.constraint(equalTo: topAnchor),
-            panel.bottomAnchor.constraint(equalTo: bottomAnchor),
-
-            badgeStack.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 14),
-            badgeStack.centerYAnchor.constraint(equalTo: panel.centerYAnchor),
-
-            scrollView.leadingAnchor.constraint(equalTo: badgeStack.trailingAnchor, constant: 12),
-            scrollView.trailingAnchor.constraint(equalTo: actionsStack.leadingAnchor, constant: -12),
-            scrollView.topAnchor.constraint(equalTo: panel.topAnchor, constant: 6),
-            scrollView.bottomAnchor.constraint(equalTo: panel.bottomAnchor, constant: -6),
-
-            cardsStack.topAnchor.constraint(equalTo: scrollView.topAnchor, constant: 2),
-            cardsStack.leadingAnchor.constraint(equalTo: scrollView.leadingAnchor),
-            cardsStack.heightAnchor.constraint(equalToConstant: 96),
-
-            actionsStack.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -14),
-            actionsStack.centerYAnchor.constraint(equalTo: panel.centerYAnchor)
-        ])
+        NotificationCenter.default.addObserver(self, selector: #selector(refreshAppearance),
+                                               name: AppSettings.didChange, object: AppSettings.shared)
+        configure(position: .top, density: .large)
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) não suportado.") }
 
+    func configure(position: BarPosition, density: BarDensity) {
+        self.position = position
+        self.density = density
+        NSLayoutConstraint.deactivate(layoutConstraints)
+        let vertical = position.isVertical
+        cardsStack.orientation = vertical ? .vertical : .horizontal
+        cardsStack.alignment = vertical ? .centerX : .centerY
+        cardsStack.spacing = density == .large ? 10 : 7
+        badgeStack.orientation = vertical ? .horizontal : .vertical
+        badgeStack.alignment = vertical ? .centerY : .leading
+        actionsStack.orientation = vertical ? .vertical : .horizontal
+        actionsStack.alignment = vertical ? .centerX : .centerY
+        scrollView.hasVerticalScroller = vertical
+        scrollView.hasHorizontalScroller = !vertical
+        scrollView.horizontalScrollElasticity = vertical ? .none : .allowed
+        scrollView.verticalScrollElasticity = vertical ? .allowed : .none
+        let collapseSymbol: String
+        switch position {
+        case .top: collapseSymbol = "chevron.up"
+        case .bottom: collapseSymbol = "chevron.down"
+        case .left: collapseSymbol = "chevron.left"
+        case .right: collapseSymbol = "chevron.right"
+        }
+        collapseButton.image = NSImage(systemSymbolName: collapseSymbol, accessibilityDescription: "Recolher lista")
+        let compactSidebar = vertical && density == .icons
+        titleBadge.isHidden = compactSidebar
+        updateWindowCount()
+        disconnectButton.title = compactSidebar ? "" : "Desconectar"
+        disconnectButton.image = compactSidebar ? NSImage(systemSymbolName: "network.slash", accessibilityDescription: "Desconectar") : nil
+        appsButton.title = compactSidebar ? "" : "Apps"
+        qualityButton.title = compactSidebar ? "" : "Vídeo"
+        appsButton.imagePosition = compactSidebar ? .imageOnly : .imageLeading
+        qualityButton.imagePosition = compactSidebar ? .imageOnly : .imageLeading
+        let edges = [panel.leadingAnchor.constraint(equalTo: leadingAnchor), panel.trailingAnchor.constraint(equalTo: trailingAnchor), panel.topAnchor.constraint(equalTo: topAnchor), panel.bottomAnchor.constraint(equalTo: bottomAnchor)]
+        let content: [NSLayoutConstraint]
+        if vertical {
+            content = [
+                badgeStack.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 12),
+                badgeStack.trailingAnchor.constraint(lessThanOrEqualTo: panel.trailingAnchor, constant: -12),
+                badgeStack.topAnchor.constraint(equalTo: panel.topAnchor, constant: 12),
+                scrollView.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 6),
+                scrollView.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -6),
+                scrollView.topAnchor.constraint(equalTo: badgeStack.bottomAnchor, constant: 8),
+                scrollView.bottomAnchor.constraint(equalTo: actionsStack.topAnchor, constant: -8),
+                cardsStack.topAnchor.constraint(equalTo: scrollView.topAnchor, constant: 2),
+                cardsStack.centerXAnchor.constraint(equalTo: scrollView.centerXAnchor),
+                cardsStack.widthAnchor.constraint(equalTo: scrollView.widthAnchor, constant: -8),
+                actionsStack.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 10),
+                actionsStack.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -10),
+                actionsStack.bottomAnchor.constraint(equalTo: panel.bottomAnchor, constant: -10)
+            ]
+        } else {
+            content = [
+                badgeStack.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 14),
+                badgeStack.centerYAnchor.constraint(equalTo: panel.centerYAnchor),
+                scrollView.leadingAnchor.constraint(equalTo: badgeStack.trailingAnchor, constant: 12),
+                scrollView.trailingAnchor.constraint(equalTo: actionsStack.leadingAnchor, constant: -12),
+                scrollView.topAnchor.constraint(equalTo: panel.topAnchor, constant: 6),
+                scrollView.bottomAnchor.constraint(equalTo: panel.bottomAnchor, constant: -6),
+                cardsStack.topAnchor.constraint(equalTo: scrollView.topAnchor, constant: 2),
+                cardsStack.leadingAnchor.constraint(equalTo: scrollView.leadingAnchor),
+                cardsStack.heightAnchor.constraint(equalTo: scrollView.heightAnchor, constant: -4),
+                actionsStack.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -14),
+                actionsStack.centerYAnchor.constraint(equalTo: panel.centerYAnchor)
+            ]
+        }
+        layoutConstraints = edges + content
+        NSLayoutConstraint.activate(layoutConstraints)
+        for card in cardViews.values { card.configure(density: density) }
+        removeFavoriteViews()
+        favoritePresentation.removeAll()
+        renderFavorites()
+    }
+
+    func setHostKey(_ key: String) {
+        hostKey = key
+        favorites = favoriteStore.favorites(forHost: key)
+        for window in currentWindows { cardViews[window.id]?.isFavorite = favorites.contains(FavoriteApp(process: window.process)) }
+        removeFavoriteViews()
+        favoritePresentation.removeAll()
+        renderFavorites()
+    }
+
     func setWindows(_ windows: [RemoteWindow], selectedId: Int64?) {
         self.selectedId = selectedId
-        countBadge.stringValue = "\(windows.count) aberta\(windows.count == 1 ? "" : "s")"
-
         let newIds = windows.map(\.id)
         let oldIds = currentWindows.map(\.id)
-
-        // Se a lista de janelas for idêntica, apenas atualiza a seleção sem recriar views
-        if newIds == oldIds {
-            setSelected(windowId: selectedId)
-            return
-        }
-
-        self.currentWindows = windows
-
-        // Remove do cache janelas que não existem mais no PC
+        currentWindows = windows
+        updateWindowCount()
         let activeSet = Set(newIds)
         cachedThumbnails = cachedThumbnails.filter { activeSet.contains($0.key) }
 
-        // Reconstrução dos cards mantendo as miniaturas cacheadas
-        for card in cardViews.values {
-            card.removeFromSuperview()
+        if newIds != oldIds {
+            for card in cardViews.values { cardsStack.removeArrangedSubview(card); card.removeFromSuperview() }
+            cardViews.removeAll()
+            for window in windows {
+                let card = ThumbnailCardView(target: window, size: cardSize)
+                cardViews[window.id] = card
+                cardsStack.addArrangedSubview(card)
+            }
         }
-        cardViews.removeAll()
-
         for window in windows {
-            let card = ThumbnailCardView(target: window)
-            card.isSelected = (window.id == selectedId)
-            if let cached = cachedThumbnails[window.id] {
-                card.thumbnailImage = cached
-            }
-            card.onClick = { [weak self] in
-                self?.onSelectWindow?(window)
-            }
-            card.onDetach = { [weak self] in
-                self?.onDetachWindow?(window)
-            }
-            cardViews[window.id] = card
-            cardsStack.addArrangedSubview(card)
+            guard let card = cardViews[window.id] else { continue }
+            card.update(target: window)
+            card.configure(density: density)
+            card.isSelected = window.id == selectedId
+            card.isFavorite = favorites.contains(FavoriteApp(process: window.process))
+            card.thumbnailImage = density == .icons ? nil : cachedThumbnails[window.id]
+            card.onClick = { [weak self] in self?.onSelectWindow?(window) }
+            card.onDetach = { [weak self] in self?.onDetachWindow?(window) }
+            card.onToggleFavorite = { [weak self] in self?.toggleFavorite(for: window) }
         }
+        let presentation = Dictionary(uniqueKeysWithValues: favorites.map { favorite in
+            let window = windows.first { FavoriteApp(process: $0.process) == favorite }
+            return (favorite.process, window?.icon ?? "closed")
+        })
+        if presentation != favoritePresentation {
+            removeFavoriteViews()
+            favoritePresentation = presentation
+        }
+        renderFavorites()
     }
 
     func reset() {
         currentWindows.removeAll()
         cachedThumbnails.removeAll()
         selectedId = nil
-        countBadge.stringValue = "0"
-        for card in cardViews.values {
-            card.removeFromSuperview()
-        }
+        updateWindowCount()
+        for card in cardViews.values { cardsStack.removeArrangedSubview(card); card.removeFromSuperview() }
         cardViews.removeAll()
+        removeFavoriteViews()
+        favoritePresentation = Dictionary(uniqueKeysWithValues: favorites.map { ($0.process, "closed") })
+        renderFavorites()
     }
 
     func setSelected(windowId: Int64?) {
-        self.selectedId = windowId
-        for (id, card) in cardViews {
-            card.isSelected = (id == windowId)
-        }
+        selectedId = windowId
+        for (id, card) in cardViews { card.isSelected = id == windowId }
+        renderFavorites()
     }
 
     func updateThumbnail(windowId: Int64, cgImage: CGImage) {
-        let nsImage = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
-        cachedThumbnails[windowId] = nsImage
-        if let card = cardViews[windowId] {
-            card.thumbnailImage = nsImage
+        let image = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
+        cachedThumbnails[windowId] = image
+        cardViews[windowId]?.thumbnailImage = image
+        renderFavorites()
+    }
+
+    private var cardSize: NSSize {
+        switch density {
+        case .large: NSSize(width: 160, height: 96)
+        case .compact: NSSize(width: 116, height: 76)
+        case .icons: NSSize(width: 58, height: 58)
+        }
+    }
+
+    private var favoriteCardSize: NSSize {
+        switch density {
+        case .large: NSSize(width: 92, height: 96)
+        case .compact: NSSize(width: 76, height: 76)
+        case .icons: NSSize(width: 58, height: 58)
+        }
+    }
+
+    private func updateWindowCount() {
+        countBadge.stringValue = position.isVertical && density == .icons
+            ? "\(currentWindows.count)"
+            : "\(currentWindows.count) aberta\(currentWindows.count == 1 ? "" : "s")"
+    }
+
+    private func toggleFavorite(for window: RemoteWindow) {
+        guard !window.isMonitor else { return }
+        let favorite = FavoriteApp(process: window.process)
+        if let index = favorites.firstIndex(of: favorite) { favorites.remove(at: index) }
+        else { favorites.append(favorite) }
+        favoriteStore.save(favorites, forHost: hostKey)
+        for item in currentWindows { cardViews[item.id]?.isFavorite = favorites.contains(FavoriteApp(process: item.process)) }
+        renderFavorites()
+    }
+
+    private func removeFavorite(_ favorite: FavoriteApp) {
+        favorites.removeAll { $0 == favorite }
+        favoriteStore.save(favorites, forHost: hostKey)
+        for window in currentWindows { cardViews[window.id]?.isFavorite = favorites.contains(FavoriteApp(process: window.process)) }
+        removeFavoriteViews()
+        favoritePresentation.removeAll()
+        renderFavorites()
+    }
+
+    private func moveFavorite(_ process: String, relativeTo target: String, after: Bool) {
+        guard let source = favorites.firstIndex(where: { $0.process == process }),
+              let destination = favorites.firstIndex(where: { $0.process == target }) else { return }
+        let favorite = favorites.remove(at: source)
+        let adjustedDestination = destination - (source < destination ? 1 : 0)
+        favorites.insert(favorite, at: adjustedDestination + (after ? 1 : 0))
+        favoriteStore.save(favorites, forHost: hostKey)
+        removeFavoriteViews()
+        renderFavorites()
+    }
+
+    private func removeFavoriteViews() {
+        for view in favoriteViews.values { cardsStack.removeArrangedSubview(view); view.removeFromSuperview() }
+        favoriteViews.removeAll()
+    }
+
+    private func renderFavorites() {
+        let wanted = Set(favorites.map(\.process))
+        for process in Set(favoriteViews.keys).subtracting(wanted) {
+            if let view = favoriteViews.removeValue(forKey: process) {
+                cardsStack.removeArrangedSubview(view)
+                view.removeFromSuperview()
+            }
+        }
+        for (index, favorite) in favorites.enumerated() {
+            let matching = currentWindows.first { FavoriteApp(process: $0.process) == favorite }
+            let icon = matching.flatMap { window in
+                window.icon.flatMap { encoded in Data(base64Encoded: encoded).flatMap { NSImage(data: $0) } }
+            }
+            let view = favoriteViews[favorite.process] ?? FavoriteAppCardView(favorite: favorite, icon: icon, size: favoriteCardSize)
+            if favoriteViews[favorite.process] == nil {
+                favoriteViews[favorite.process] = view
+                cardsStack.insertArrangedSubview(view, at: index)
+            }
+            view.isSelected = selectedId.flatMap { id in currentWindows.first(where: { $0.id == id }) }
+                .map { FavoriteApp(process: $0.process) == favorite } ?? false
+            view.onActivate = { [weak self, weak view] in
+                guard let self, let view else { return }
+                self.onActivateFavorite?(favorite, view)
+            }
+            view.onRemove = { [weak self] in self?.removeFavorite(favorite) }
+            view.isVerticalOrder = position.isVertical
+            view.onMove = { [weak self] process, after in self?.moveFavorite(process, relativeTo: favorite.process, after: after) }
         }
     }
 
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
         if let hoverTracking { removeTrackingArea(hoverTracking) }
-        let area = NSTrackingArea(rect: bounds,
-                                  options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
-                                  owner: self, userInfo: nil)
+        let area = NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect], owner: self, userInfo: nil)
         addTrackingArea(area)
         hoverTracking = area
     }
 
     override func mouseEntered(with event: NSEvent) { onHoverChanged?(true) }
     override func mouseExited(with event: NSEvent) { onHoverChanged?(false) }
-
+    @objc private func refreshAppearance() {
+        for (id, card) in cardViews { card.isSelected = id == selectedId }
+        for (process, view) in favoriteViews {
+            view.isSelected = selectedId.flatMap { id in currentWindows.first(where: { $0.id == id }) }
+                .map { FavoriteApp(process: $0.process).process == process } ?? false
+        }
+    }
     @objc private func didClickCollapse() { onCollapse?() }
-
-    @objc private func didClickRefresh() {
-        onRefresh?()
-    }
-
-    @objc private func didClickDisconnect() {
-        onDisconnect?()
-    }
+    @objc private func didClickRefresh() { onRefresh?() }
+    @objc private func didClickDisconnect() { onDisconnect?() }
+    @objc private func didClickApps() { onOpenApps?() }
+    @objc private func didClickQuality() { onShowQuality?(qualityButton) }
 }

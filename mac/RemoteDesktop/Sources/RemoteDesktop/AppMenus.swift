@@ -13,17 +13,19 @@ enum AppMenus {
 
         // 1. Menu do aplicativo
         let applicationItem = NSMenuItem()
-        applicationItem.title = "RemoteDesktop"
+        applicationItem.title = "Paneo"
         mainMenu.addItem(applicationItem)
 
-        let applicationMenu = NSMenu(title: "RemoteDesktop")
-        applicationMenu.addItem(item("Sobre RemoteDesktop", #selector(NSApplication.orderFrontStandardAboutPanel(_:)), ""))
+        let applicationMenu = NSMenu(title: "Paneo")
+        applicationMenu.addItem(item("Sobre Paneo", #selector(NSApplication.orderFrontStandardAboutPanel(_:)), ""))
         applicationMenu.addItem(.separator())
-        applicationMenu.addItem(item("Ocultar RemoteDesktop", #selector(NSApplication.hide(_:)), "h"))
+        applicationMenu.addItem(item("Ocultar Paneo", #selector(NSApplication.hide(_:)), "h"))
         applicationMenu.addItem(item("Ocultar os Outros", #selector(NSApplication.hideOtherApplications(_:)), ""))
         applicationMenu.addItem(item("Mostrar Todos", #selector(NSApplication.unhideAllApplications(_:)), ""))
         applicationMenu.addItem(.separator())
-        applicationMenu.addItem(item("Encerrar RemoteDesktop", #selector(NSApplication.terminate(_:)), "q"))
+        applicationMenu.addItem(item("Ajustes…", #selector(AppDelegate.showSettings(_:)), ","))
+        applicationMenu.addItem(.separator())
+        applicationMenu.addItem(item("Encerrar Paneo", #selector(NSApplication.terminate(_:)), "q"))
         applicationItem.submenu = applicationMenu
 
         // 2. Arquivo

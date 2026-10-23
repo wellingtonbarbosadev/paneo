@@ -170,9 +170,10 @@ struct RemoteWindow: Decodable, Identifiable, Sendable {
     let icon: String?
     /// HMONITOR quando o item representa a tela inteira de um monitor do PC.
     let monitorId: Int64?
+    var minimized: Bool
 
     enum CodingKeys: String, CodingKey {
-        case id, title, process, width, height, icon
+        case id, title, process, width, height, icon, minimized
     }
 
     /// Processo sintético usado nos cards de tela inteira.
@@ -207,11 +208,13 @@ struct RemoteWindow: Decodable, Identifiable, Sendable {
         height = try container.decode(Int.self, forKey: .height)
         icon = try container.decodeIfPresent(String.self, forKey: .icon)
         monitorId = nil
+        minimized = (try? container.decode(Bool.self, forKey: .minimized)) ?? false
     }
 
     init(id: Int64, title: String, process: String, width: Int, height: Int, icon: String? = nil,
-         monitorId: Int64? = nil) {
+         monitorId: Int64? = nil, minimized: Bool = false) {
         self.monitorId = monitorId
+        self.minimized = minimized
         self.id = id
         self.title = title
         self.process = process
@@ -231,12 +234,36 @@ struct RemoteWindow: Decodable, Identifiable, Sendable {
     }
 }
 
+struct RemoteWindowState: Decodable, Sendable, Equatable {
+    let windowId: Int64
+    let minimized: Bool
+    let maximized: Bool
+    let reading: Bool
+    let canResize: Bool
+}
+
+struct RemoteWindowMenuItem: Decodable, Sendable, Equatable {
+    let id: String
+    let title: String
+    let enabled: Bool
+    let checked: Bool
+    let separator: Bool
+    let children: [RemoteWindowMenuItem]
+}
+
+struct RemoteWindowMenus: Decodable, Sendable, Equatable {
+    let supported: Bool
+    let items: [RemoteWindowMenuItem]
+    let reason: String?
+}
+
 /// Aplicativo disponível para lançamento no Windows.
 struct RemoteApp: Decodable, Identifiable, Sendable, Equatable {
     let id: String
     let name: String
     let cmd: String
     let icon: String?
+    let process: String?
 }
 
 /// Monitor físico do PC, publicado na lista `windows` para a tela inteira.
@@ -255,14 +282,18 @@ enum HostMessage {
     case ready(role: String, host: String?, deviceToken: Data?)
     case authFailed(message: String, retryAfter: Int)
     case windows([RemoteWindow], monitors: [RemoteMonitor], apps: [RemoteApp] = [])
+    case appsChunk(index: Int, total: Int, apps: [RemoteApp], truncated: Bool)
     case inputRejected(String)
     case error(String)
     case pong
-    case video(codec: String, width: Int, height: Int)
+    case video(codec: String, width: Int, height: Int, supportsScaling: Bool)
     /// Posição/tamanho da janela dentro do quadro (muda quando um popup abre).
     case viewport(x: Int, y: Int, width: Int, height: Int)
     case clipboard(String)
     case fileReceived(String)
+    case windowState(RemoteWindowState)
+    case windowCommandResult(action: String, success: Bool, message: String?)
+    case windowMenus(RemoteWindowMenus)
 
     private struct Wire: Decodable {
         let type: String
@@ -275,18 +306,34 @@ enum HostMessage {
         let windows: [RemoteWindow]?
         let monitors: [RemoteMonitor]?
         let apps: [RemoteApp]?
+        let index: Int?
+        let total: Int?
+        let truncated: Bool?
         let message: String?
         let retryAfterSeconds: Int?
         let codec: String?
         let width: Int?
         let height: Int?
+        let maxDimension: Bool?
         let x: Int?
         let y: Int?
         let text: String?
         let name: String?
+        let windowId: Int64?
+        let minimized: Bool?
+        let maximized: Bool?
+        let reading: Bool?
+        let canResize: Bool?
+        let action: String?
+        let success: Bool?
+        let enabled: Bool?
+        let items: [RemoteWindowMenuItem]?
+        let supported: Bool?
+        let reason: String?
     }
 
     static func decode(_ payload: Data) throws -> HostMessage {
+        try validateMenuTree(payload)
         let wire: Wire
         do { wire = try JSONDecoder().decode(Wire.self, from: payload) }
         catch { throw ProtocolError.malformed }
@@ -310,6 +357,10 @@ enum HostMessage {
                                retryAfter: wire.retryAfterSeconds ?? 0)
         case "windows":
             return .windows(wire.windows ?? [], monitors: wire.monitors ?? [], apps: wire.apps ?? [])
+        case "apps":
+            guard let index = wire.index, let total = wire.total,
+                  total > 0, total <= 1024, index >= 0, index < total else { throw ProtocolError.malformed }
+            return .appsChunk(index: index, total: total, apps: wire.apps ?? [], truncated: wire.truncated == true)
         case "inputRejected":
             return .inputRejected(wire.message ?? "o Windows recusou a entrada")
         case "error":
@@ -318,7 +369,8 @@ enum HostMessage {
             return .pong
         case "video":
             return .video(codec: wire.codec ?? "desconhecido",
-                          width: wire.width ?? 0, height: wire.height ?? 0)
+                          width: wire.width ?? 0, height: wire.height ?? 0,
+                          supportsScaling: wire.codec == "h264" && wire.maxDimension == true)
         case "viewport":
             return .viewport(x: wire.x ?? 0, y: wire.y ?? 0,
                              width: wire.width ?? 0, height: wire.height ?? 0)
@@ -326,8 +378,36 @@ enum HostMessage {
             return .clipboard(wire.text ?? "")
         case "fileReceived":
             return .fileReceived(wire.name ?? "")
+        case "windowState":
+            guard let windowId = wire.windowId, let minimized = wire.minimized,
+                  let maximized = wire.maximized, let reading = wire.reading,
+                  let canResize = wire.canResize else { throw ProtocolError.malformed }
+            return .windowState(RemoteWindowState(windowId: windowId, minimized: minimized,
+                                                  maximized: maximized, reading: reading,
+                                                  canResize: canResize))
+        case "windowCommandResult":
+            guard let action = wire.action, let success = wire.success else { throw ProtocolError.malformed }
+            return .windowCommandResult(action: action, success: success, message: wire.message)
+        case "windowMenus":
+            guard let supported = wire.supported else { throw ProtocolError.malformed }
+            return .windowMenus(RemoteWindowMenus(supported: supported, items: wire.items ?? [], reason: wire.reason))
         default:
             throw ProtocolError.unsupported("Mensagem do host não reconhecida.")
+        }
+    }
+
+    private static func validateMenuTree(_ payload: Data) throws {
+        guard let object = try? JSONSerialization.jsonObject(with: payload) as? [String: Any],
+              object["type"] as? String == "windowMenus",
+              let items = object["items"] as? [[String: Any]] else { return }
+        var pending = items.map { ($0, 1) }
+        var count = 0
+        while let (item, depth) = pending.popLast() {
+            count += 1
+            guard count <= 128, depth <= 4 else { throw ProtocolError.tooLarge }
+            if let children = item["children"] as? [[String: Any]] {
+                pending.append(contentsOf: children.map { ($0, depth + 1) })
+            }
         }
     }
 }
@@ -341,6 +421,7 @@ private struct HelloPayload: Encodable {
     let windowId: Int64?
     let monitorId: Int64?
     let clientName: String
+    let windowCommands: Bool
 }
 
 private struct AuthPayload: Encodable {
@@ -408,6 +489,7 @@ private struct QualityPayload: Encodable {
     let type = "quality"
     let fps: Int
     let bitrate: Int
+    let maxDimension: Int
 }
 
 private struct FileChunkPayload: Encodable {
@@ -418,10 +500,24 @@ private struct FileChunkPayload: Encodable {
     let isLast: Bool
 }
 
+private struct WindowActionPayload: Encodable {
+    let type = "windowAction"
+    let action: String
+    let enabled: Bool?
+    let width: Int?
+    let height: Int?
+}
+
+private struct WindowMenuInvokePayload: Encodable {
+    let type = "windowMenuInvoke"
+    let id: String
+}
+
 enum OutgoingMessage {
 
     static func hello(role: String, windowId: Int64? = nil, monitorId: Int64? = nil, clientName: String = "Mac") -> Data? {
-        encode(HelloPayload(role: role, windowId: windowId, monitorId: monitorId, clientName: clientName))
+        encode(HelloPayload(role: role, windowId: windowId, monitorId: monitorId,
+                            clientName: clientName, windowCommands: role == "view"))
     }
 
     static func auth(mode: String, proof: Data) -> Data? {
@@ -440,11 +536,21 @@ enum OutgoingMessage {
 
     static func launch(app: String) -> Data? { encode(LaunchPayload(app: app)) }
 
-    static func quality(fps: Int, bitrate: Int) -> Data? { encode(QualityPayload(fps: fps, bitrate: bitrate)) }
+    static func quality(fps: Int, bitrate: Int, maxDimension: Int = 0) -> Data? {
+        encode(QualityPayload(fps: fps, bitrate: bitrate, maxDimension: maxDimension))
+    }
 
     static func fileChunk(name: String, data: String, isFirst: Bool, isLast: Bool) -> Data? {
         encode(FileChunkPayload(name: name, data: data, isFirst: isFirst, isLast: isLast))
     }
+
+    static func windowAction(_ action: String, enabled: Bool? = nil, width: Int? = nil, height: Int? = nil) -> Data? {
+        encode(WindowActionPayload(action: action, enabled: enabled, width: width, height: height))
+    }
+
+    static func windowMenus() -> Data? { encode(SimplePayload(type: "windowMenus")) }
+
+    static func windowMenuInvoke(id: String) -> Data? { encode(WindowMenuInvokePayload(id: id)) }
 
     static func click(x: Double, y: Double, button: RemoteMouseButton) -> Data? {
         encode(ClickPayload(x: x, y: y, button: button.rawValue))

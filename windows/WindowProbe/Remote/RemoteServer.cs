@@ -7,6 +7,7 @@ using System.Diagnostics;
 using System.Net;
 using System.Net.Security;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
 using System.Security.Authentication;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
@@ -59,6 +60,7 @@ internal sealed class RemoteServer : IDisposable
     /// <summary>Receptor de arquivos enviados pelo Mac (injetável nos testes).</summary>
     private readonly FileReceiver fileReceiver;
     private readonly bool ownsFileReceiver;
+    private readonly Func<IntPtr, uint, IWindowCommands>? windowCommandsFactory;
 
     /// <summary>SHA-256 do certificado DER, em hexadecimal maiúsculo.</summary>
     public string Fingerprint { get; }
@@ -94,12 +96,14 @@ internal sealed class RemoteServer : IDisposable
         bool enableVideo = true,
         WindowsClipboard? clipboard = null,
         Func<string, bool>? appLauncher = null,
-        FileReceiver? fileReceiver = null)
+        FileReceiver? fileReceiver = null,
+        Func<IntPtr, uint, IWindowCommands>? windowCommandsFactory = null)
     {
         hwnd = window;
         this.credentials = credentials ?? throw new ArgumentNullException(nameof(credentials));
         this.windowList = windowList;
         this.enableVideo = enableVideo;
+        this.windowCommandsFactory = windowCommandsFactory;
         this.clipboard = clipboard ?? WindowsClipboard.Shared;
         launchApp = appLauncher ?? AppLauncher.Launch;
         if (fileReceiver is null)
@@ -249,12 +253,12 @@ internal sealed class RemoteServer : IDisposable
             if (handshake.Role == "control")
             {
                 Status?.Invoke("Mac autenticado. Lista de janelas disponível.");
-                await RunControlAsync(tls, session).ConfigureAwait(false);
+                await RunControlAsync(tls, session, handshake.AppCatalog).ConfigureAwait(false);
             }
             else
             {
                 Status?.Invoke("Mac autenticado. Compartilhando janela autorizada.");
-                try { await RunViewAsync(tls, session, handshake.WindowId, handshake.MonitorId).ConfigureAwait(false); }
+                try { await RunViewAsync(tls, session, handshake.WindowId, handshake.MonitorId, handshake.WindowCommands).ConfigureAwait(false); }
                 finally
                 {
                     if (lastVideo is not null) VideoTimings = lastVideo.TimingSnapshot();
@@ -268,7 +272,7 @@ internal sealed class RemoteServer : IDisposable
         }
     }
 
-    private sealed record HandshakeResult(string Role, string? DeviceToken, long? WindowId, long? MonitorId = null);
+    private sealed record HandshakeResult(string Role, string? DeviceToken, long? WindowId, long? MonitorId = null, bool AppCatalog = false, bool WindowCommands = false);
 
     private async Task<HandshakeResult?> PerformHandshakeAsync(
         SslStream tls, TcpClient client, CancellationToken sessionToken)
@@ -286,6 +290,8 @@ internal sealed class RemoteServer : IDisposable
         string clientName;
         long? requestedWindow = null;
         long? requestedMonitor = null;
+        bool appCatalog = false;
+        bool windowCommands = false;
         using (JsonDocument hello = helloFrame.ParseControl())
         {
             JsonElement root = hello.RootElement;
@@ -302,6 +308,10 @@ internal sealed class RemoteServer : IDisposable
             }
 
             role = GetString(root, "role") ?? "";
+            appCatalog = root.TryGetProperty("appCatalog", out JsonElement appCatalogValue)
+                && appCatalogValue.ValueKind == JsonValueKind.True;
+            windowCommands = role == "view" && root.TryGetProperty("windowCommands", out JsonElement windowCommandsValue)
+                && windowCommandsValue.ValueKind == JsonValueKind.True;
             if (role is not ("view" or "control"))
             {
                 await TrySendErrorAsync(tls, "Papel de sessão inválido.", sessionToken).ConfigureAwait(false);
@@ -431,12 +441,12 @@ internal sealed class RemoteServer : IDisposable
         }
 
         // No modo device o token recebido não é reenviado em ready.
-        return new HandshakeResult(role, deviceToken, requestedWindow, requestedMonitor);
+        return new HandshakeResult(role, deviceToken, requestedWindow, requestedMonitor, appCatalog, windowCommands);
     }
 
-    private async Task RunControlAsync(SslStream tls, CancellationTokenSource session)
+    private async Task RunControlAsync(SslStream tls, CancellationTokenSource session, bool appCatalog)
     {
-        await SendWindowsAsync(tls, session.Token).ConfigureAwait(false);
+        await SendWindowsAsync(tls, session.Token, appCatalog).ConfigureAwait(false);
 
         while (!session.IsCancellationRequested)
         {
@@ -464,7 +474,7 @@ internal sealed class RemoteServer : IDisposable
             switch (GetString(root, "type"))
             {
                 case "list":
-                    await SendWindowsAsync(tls, session.Token).ConfigureAwait(false);
+                    await SendWindowsAsync(tls, session.Token, appCatalog).ConfigureAwait(false);
                     break;
                 case "ping":
                     await SendControlAsync(tls, new { type = "pong" }, session.Token).ConfigureAwait(false);
@@ -520,6 +530,10 @@ internal sealed class RemoteServer : IDisposable
         private VideoFramePacer pacer = new(VideoFps);
         private int fps = VideoFps;
         private int bitrate = VideoBitrate;
+        private int maxDimension;
+        private byte[]? scaledBuffer;
+        private double inputScaleX = 1;
+        private double inputScaleY = 1;
         /// <summary>Pedido de quality: o encoder é recriado no próximo quadro.</summary>
         private bool reconfigure;
 
@@ -536,6 +550,33 @@ internal sealed class RemoteServer : IDisposable
 
         /// <summary>Bitrate corrente do encoder.</summary>
         public int TargetBitrate { get { lock (gate) return bitrate; } }
+
+        public int MaxDimension { get { lock (gate) return maxDimension; } }
+        public (double X, double Y) InputScale { get { lock (gate) return (inputScaleX, inputScaleY); } }
+
+        public void UpdateInputScale(int sourceWidth, int sourceHeight, int encodedWidth, int encodedHeight)
+        {
+            lock (gate)
+            {
+                inputScaleX = sourceWidth > 0 ? (double)encodedWidth / sourceWidth : 1;
+                inputScaleY = sourceHeight > 0 ? (double)encodedHeight / sourceHeight : 1;
+            }
+        }
+
+        public RawPixelFrame Scale(RawPixelFrame frame)
+        {
+            lock (gate)
+            {
+                var scaled = VideoScaling.Apply(frame.Bgra, frame.Width, frame.Height, frame.Stride, maxDimension, ref scaledBuffer);
+                return scaled.Pixels == frame.Bgra ? frame : frame with
+                {
+                    Bgra = scaled.Pixels,
+                    Width = scaled.Width,
+                    Height = scaled.Height,
+                    Stride = scaled.Stride
+                };
+            }
+        }
 
         /// <summary>
         /// Reconfigura a cadência. O pacer vale imediatamente e o encoder é
@@ -565,6 +606,17 @@ internal sealed class RemoteServer : IDisposable
             {
                 if (value == bitrate) return;
                 bitrate = value;
+                reconfigure = true;
+            }
+        }
+
+        public void UpdateMaxDimension(int targetMaxDimension)
+        {
+            if (targetMaxDimension != 0 && (targetMaxDimension is < 320 or > 4096)) return;
+            lock (gate)
+            {
+                if (targetMaxDimension == maxDimension) return;
+                maxDimension = targetMaxDimension;
                 reconfigure = true;
             }
         }
@@ -736,8 +788,80 @@ internal sealed class RemoteServer : IDisposable
         return null;
     }
 
+    private uint ResolveProcessId(IntPtr target)
+    {
+        try
+        {
+            WindowDescriptor? descriptor = windowList?.Invoke().FirstOrDefault(window => window.Id == target.ToInt64());
+            if (descriptor?.ProcessId > 0) return descriptor.ProcessId;
+        }
+        catch { }
+        if (!OperatingSystem.IsWindows()) return 0;
+        _ = GetWindowThreadProcessId(target, out uint processId);
+        return processId;
+    }
+
+    private static async Task<bool> WaitUntilRestoredAsync(IWindowCommands commands, CancellationToken token)
+    {
+        while (commands.State.Minimized)
+        {
+            await Task.Delay(200, token).ConfigureAwait(false);
+        }
+        return !token.IsCancellationRequested;
+    }
+
+    private async Task WatchWindowStateAsync(SslStream tls, IWindowCommands commands, CancellationToken token)
+    {
+        RemoteWindowState previous = commands.State;
+        while (!token.IsCancellationRequested)
+        {
+            await Task.Delay(200, token).ConfigureAwait(false);
+            RemoteWindowState current = commands.State;
+            if (current == previous) continue;
+            previous = current;
+            await SendWindowStateAsync(tls, current, token).ConfigureAwait(false);
+        }
+    }
+
+    private Task SendWindowStateAsync(SslStream tls, RemoteWindowState state, CancellationToken token) =>
+        SendControlAsync(tls, new
+        {
+            type = "windowState", windowId = state.WindowId, minimized = state.Minimized,
+            maximized = state.Maximized, reading = state.Reading, canResize = state.CanResize
+        }, token);
+
+    private Task SendWindowCommandResultAsync(SslStream tls, RemoteWindowCommandResult result, CancellationToken token) =>
+        SendControlAsync(tls, new { type = "windowCommandResult", action = result.Action, success = result.Success, message = result.Message }, token);
+
+    private async Task SendWindowMenusAsync(SslStream tls, RemoteWindowMenus menus, CancellationToken token)
+    {
+        object payload = new
+        {
+            type = "windowMenus", supported = menus.Supported, reason = menus.Reason,
+            items = menus.Items.Select(MenuItemJson).ToArray()
+        };
+        if (JsonSerializer.SerializeToUtf8Bytes(payload).Length > ProtocolV2.MaxControlHostToClient)
+        {
+            payload = new
+            {
+                type = "windowMenus", supported = false,
+                reason = "O menu excede o limite de tamanho suportado.",
+                items = Array.Empty<object>()
+            };
+        }
+        await SendControlAsync(tls, payload, token).ConfigureAwait(false);
+    }
+
+    private static object MenuItemJson(RemoteWindowMenuItem item) => new
+    {
+        id = item.Id, title = item.Title, enabled = item.Enabled, @checked = item.Checked,
+        separator = item.Separator, children = item.Children.Select(MenuItemJson).ToArray()
+    };
+
+    [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint processId);
+
     private async Task RunViewAsync(
-        SslStream tls, CancellationTokenSource session, long? requestedWindow, long? requestedMonitor = null)
+        SslStream tls, CancellationTokenSource session, long? requestedWindow, long? requestedMonitor = null, bool enableWindowCommands = false)
     {
         IntPtr monitorHandle = IntPtr.Zero;
         IntPtr windowHandle = IntPtr.Zero;
@@ -761,6 +885,13 @@ internal sealed class RemoteServer : IDisposable
             windowHandle = target.Value;
         }
 
+        using IWindowCommands? windowCommands = monitorHandle != IntPtr.Zero || !enableWindowCommands
+            ? null
+            : windowCommandsFactory?.Invoke(windowHandle, ResolveProcessId(windowHandle))
+                ?? (OperatingSystem.IsWindows()
+                    ? new WindowCommands(windowHandle, ResolveProcessId(windowHandle))
+                    : new UnavailableWindowCommands(windowHandle));
+
         using var wake = new DisplayWakeLock();
         DisplayAwake = wake.Acquired;
         MonitorWoken = wake.MonitorWoken;
@@ -769,11 +900,15 @@ internal sealed class RemoteServer : IDisposable
             ? new RemoteInput(monitorHandle, fullScreen: true)
             : new RemoteInput(windowHandle);
         input.AllowHover = allowHover;
+        if (windowCommands is not null)
+            await SendWindowStateAsync(tls, windowCommands.State, session.Token).ConfigureAwait(false);
         using var mediaInFlight = new SemaphoreSlim(2, 2);
         var video = new VideoChannel();
         lastVideo = video;
         video.RequestKeyframe();
-        Task receive = ReceiveViewAsync(tls, input, video, session);
+        Task receive = ReceiveViewAsync(tls, input, video, session, windowCommands);
+        using var stateStop = CancellationTokenSource.CreateLinkedTokenSource(session.Token);
+        Task stateWatcher = windowCommands is null ? Task.CompletedTask : WatchWindowStateAsync(tls, windowCommands, stateStop.Token);
 
         try
         {
@@ -781,14 +916,32 @@ internal sealed class RemoteServer : IDisposable
             for (int attempt = 0; attempt < 2; attempt++)
             {
                 bool raw = enableVideo && attempt == 0;
+                if (!raw) video.UpdateInputScale(1, 1, 1, 1);
                 try
                 {
-                    await RunCaptureAsync(tls, video, raw, mediaInFlight, windowHandle, session, monitorHandle).ConfigureAwait(false);
+                    while (!session.IsCancellationRequested)
+                    {
+                        if (windowCommands is not null && !await WaitUntilRestoredAsync(windowCommands, session.Token).ConfigureAwait(false)) return;
+                        try
+                        {
+                            await RunCaptureAsync(tls, video, raw, mediaInFlight, windowHandle, session, monitorHandle).ConfigureAwait(false);
+                            return;
+                        }
+                        catch (CaptureException) when (windowCommands?.State.Minimized == true)
+                        {
+                            video.Announced = false;
+                        }
+                        catch (OperationCanceledException) when (windowCommands?.State.Minimized == true)
+                        {
+                            video.Announced = false;
+                        }
+                    }
                     return;
                 }
                 catch (VideoEncoderUnavailable)
                 {
                     Status?.Invoke("Sem encoder H.264 neste Windows; enviando PNG.");
+                    await SendControlAsync(tls, new { type = "video", codec = "png", width = 0, height = 0, maxDimension = false }, session.Token).ConfigureAwait(false);
                     continue;
                 }
             }
@@ -810,8 +963,10 @@ internal sealed class RemoteServer : IDisposable
         finally
         {
             session.Cancel();
+            stateStop.Cancel();
             video.Dispose();
             try { await receive.ConfigureAwait(false); } catch (Exception) { }
+            try { await stateWatcher.ConfigureAwait(false); } catch (Exception) { }
         }
     }
 
@@ -828,8 +983,9 @@ internal sealed class RemoteServer : IDisposable
     {
         using var pipelineStop = CancellationTokenSource.CreateLinkedTokenSource(session.Token);
         // Tela inteira já mostra tudo: não há popups para compor.
-        PopupComposer? popupComposer = monitorHandle == IntPtr.Zero ? new PopupComposer(windowHandle) : null;
-        (int X, int Y, int Width, int Height) lastBase = default;
+        PopupComposer? popupComposer = monitorHandle == IntPtr.Zero && OperatingSystem.IsWindows() ? new PopupComposer(windowHandle) : null;
+        (int X, int Y, int Width, int Height) lastViewport = default;
+        (int Width, int Height) lastViewportFrame = default;
         var options = new ContinuousCaptureOptions
         {
             FrameTimeout = TimeSpan.FromHours(8),
@@ -844,16 +1000,26 @@ internal sealed class RemoteServer : IDisposable
             // os desenha sobre o quadro da janela autorizada.
             RawFrame = raw ? async (rawFrame, ct) =>
             {
-                RawPixelFrame composed = popupComposer is null ? rawFrame : popupComposer.Compose(rawFrame);
+                RawPixelFrame composedFrame = popupComposer is null ? rawFrame : popupComposer.Compose(rawFrame);
+                if (composedFrame.Width is <= 0 or > ushort.MaxValue || composedFrame.Height is <= 0 or > ushort.MaxValue) return;
+                RawPixelFrame composed;
+                try { composed = video.Scale(composedFrame); }
+                catch (Exception ex) when (ex is ArgumentException or OverflowException) { return; }
                 // Informa ao Mac onde fica a janela dentro do quadro (muda só
                 // quando um popup abre/fecha) para manter a escala estável.
-                var baseRect = popupComposer?.Base ?? default;
-                if (popupComposer is not null && baseRect != lastBase)
+                (int X, int Y, int Width, int Height) baseRect = popupComposer?.Base ?? default;
+                if (baseRect.Width <= 0 || baseRect.Height <= 0)
+                    baseRect = (0, 0, composedFrame.Width, composedFrame.Height);
+                int codedWidth = VideoScaling.EncodedDimension(composed.Width);
+                int codedHeight = VideoScaling.EncodedDimension(composed.Height);
+                var viewport = VideoScaling.ScaleViewport(baseRect, composedFrame.Width, composedFrame.Height, composed.Width, composed.Height);
+                if (viewport != lastViewport || (codedWidth, codedHeight) != lastViewportFrame)
                 {
-                    lastBase = baseRect;
+                    lastViewport = viewport;
+                    lastViewportFrame = (codedWidth, codedHeight);
                     await SendControlAsync(
                         tls,
-                        new { type = "viewport", x = baseRect.X, y = baseRect.Y, width = baseRect.Width, height = baseRect.Height },
+                        new { type = "viewport", x = viewport.Item1, y = viewport.Item2, width = viewport.Item3, height = viewport.Item4 },
                         ct).ConfigureAwait(false);
                 }
                 await SendVideoFrameAsync(tls, video, composed, mediaInFlight, ct).ConfigureAwait(false);
@@ -918,13 +1084,14 @@ internal sealed class RemoteServer : IDisposable
         // cabeçalho de mídia deve refletir o que foi realmente codificado.
         int encodedWidth = encoder.Width;
         int encodedHeight = encoder.Height;
+        video.UpdateInputScale(encoder.SourceWidth, encoder.SourceHeight, encodedWidth, encodedHeight);
 
         if (!video.Announced)
         {
             video.Announced = true;
             await SendControlAsync(
                 tls,
-                new { type = "video", codec = "h264", width = encodedWidth, height = encodedHeight, fps = video.TargetFps, hardware = encoder.IsHardware },
+                new { type = "video", codec = "h264", width = encodedWidth, height = encodedHeight, fps = video.TargetFps, hardware = encoder.IsHardware, maxDimension = true },
                 ct).ConfigureAwait(false);
         }
 
@@ -977,7 +1144,7 @@ internal sealed class RemoteServer : IDisposable
         video.RecordTiming(encode, Stopwatch.GetElapsedTime(sendStart), units.Count);
     }
 
-    private async Task ReceiveViewAsync(SslStream tls, RemoteInput input, VideoChannel video, CancellationTokenSource session)
+    private async Task ReceiveViewAsync(SslStream tls, RemoteInput input, VideoChannel video, CancellationTokenSource session, IWindowCommands? windowCommands)
     {
         try
         {
@@ -1041,7 +1208,8 @@ internal sealed class RemoteServer : IDisposable
                     case "text":
                     case "key":
                     {
-                        string? rejection = input.TryApply(root);
+                        var scale = video.InputScale;
+                        string? rejection = input.TryApply(root, scale.X, scale.Y);
                         if (rejection is null)
                         {
                             Interlocked.Increment(ref inputsApplied);
@@ -1054,6 +1222,31 @@ internal sealed class RemoteServer : IDisposable
                             await SendControlAsync(
                                 tls, new { type = "inputRejected", message = rejection }, session.Token).ConfigureAwait(false);
                         }
+                        break;
+                    }
+                    case "windowAction":
+                    {
+                        string action = GetString(root, "action") ?? "";
+                        RemoteWindowCommandResult result = windowCommands?.Execute(root)
+                            ?? new(action, false, "Controles da janela não foram negociados para esta sessão ou este monitor.");
+                        await SendWindowCommandResultAsync(tls, result, session.Token).ConfigureAwait(false);
+                        if (windowCommands is not null)
+                            await SendWindowStateAsync(tls, windowCommands.State, session.Token).ConfigureAwait(false);
+                        break;
+                    }
+                    case "windowMenus":
+                    {
+                        RemoteWindowMenus menus = windowCommands?.GetMenus()
+                            ?? new(false, [], "Controles da janela não foram negociados para esta sessão ou este monitor.");
+                        await SendWindowMenusAsync(tls, menus, session.Token).ConfigureAwait(false);
+                        break;
+                    }
+                    case "windowMenuInvoke":
+                    {
+                        string id = GetString(root, "id") ?? "";
+                        RemoteWindowCommandResult result = windowCommands?.InvokeMenu(id)
+                            ?? new("menu", false, "Controles da janela não foram negociados para esta sessão ou este monitor.");
+                        await SendWindowCommandResultAsync(tls, result, session.Token).ConfigureAwait(false);
                         break;
                     }
                     default:
@@ -1079,6 +1272,7 @@ internal sealed class RemoteServer : IDisposable
     {
         if (TryGetInt32(root, "fps", out int fps)) video.UpdateFps(fps);
         if (TryGetInt32(root, "bitrate", out int bitrate)) video.UpdateBitrate(bitrate);
+        if (TryGetInt32(root, "maxDimension", out int maxDimension)) video.UpdateMaxDimension(maxDimension);
     }
 
     /// <summary>
@@ -1088,7 +1282,7 @@ internal sealed class RemoteServer : IDisposable
     private void LaunchRemoteApp(JsonElement root)
     {
         string? app = GetString(root, "app");
-        if (string.IsNullOrWhiteSpace(app) || app.Length > 64) return;
+        if (string.IsNullOrWhiteSpace(app) || app.Length > 256) return;
 
         try
         {
@@ -1206,8 +1400,9 @@ internal sealed class RemoteServer : IDisposable
         }
     }
 
-    private async Task SendWindowsAsync(SslStream tls, CancellationToken token)
+    private async Task SendWindowsAsync(SslStream tls, CancellationToken token, bool appCatalog)
     {
+        IReadOnlyList<LauncherApp> apps = appCatalog ? [] : AppLauncher.GetLegacyApps();
         IReadOnlyList<WindowDescriptor> windows;
         try { windows = windowList?.Invoke() ?? []; }
         catch { windows = []; }
@@ -1216,38 +1411,96 @@ internal sealed class RemoteServer : IDisposable
         try { monitors = MonitorEnumerator.GetMonitors(); }
         catch { monitors = []; }
 
-        await SendControlAsync(tls, new
+        var windowItems = windows.Select(window => new
+        {
+            id = window.Id,
+            title = window.Title,
+            process = window.Process,
+            width = window.Width,
+            height = window.Height,
+            minimized = window.Minimized,
+            canResize = window.CanResize,
+            icon = window.IconBase64
+        }).ToArray();
+        var monitorItems = monitors.Select((monitor, index) => new
+        {
+            id = monitor.Id,
+            name = $"Monitor {index + 1}",
+            width = monitor.Width,
+            height = monitor.Height,
+            x = monitor.X,
+            y = monitor.Y,
+            primary = monitor.Primary
+        }).ToArray();
+        var appItems = apps.Select(app => new
+        {
+            id = app.Id,
+            name = app.Name,
+            cmd = app.Command,
+            icon = app.Icon,
+            process = app.ProcessName
+        }).ToArray();
+        object payload = new
         {
             type = "windows",
-            windows = windows.Select(window => new
+            windows = windowItems,
+            monitors = monitorItems,
+            apps = appItems
+        };
+        if (JsonSerializer.SerializeToUtf8Bytes(payload).Length > ProtocolV2.MaxControlHostToClient)
+        {
+            var withoutIcons = windowItems.Select(window => new
             {
-                id = window.Id,
-                title = window.Title,
-                process = window.Process,
-                width = window.Width,
-                height = window.Height,
-                icon = window.IconBase64
-            }).ToArray(),
-            monitors = monitors.Select((monitor, index) => new
+                id = window.id,
+                title = window.title,
+                process = window.process,
+                width = window.width,
+                height = window.height,
+                minimized = window.minimized,
+                canResize = window.canResize,
+                icon = (string?)null
+            }).ToArray();
+            payload = new { type = "windows", windows = withoutIcons, monitors = monitorItems, apps = appItems };
+        }
+        await SendControlAsync(tls, payload, token).ConfigureAwait(false);
+
+        if (!appCatalog) return;
+        await SendAppCatalogAsync(tls, token).ConfigureAwait(false);
+    }
+
+    private async Task SendAppCatalogAsync(SslStream tls, CancellationToken token)
+    {
+        const int targetBytes = 48 * 1024;
+        var chunks = new List<List<object>>();
+        var chunk = new List<object>();
+        int chunkBytes = 64;
+        IReadOnlyList<LauncherApp> catalog = AppLauncher.GetKnownApps();
+        bool truncated = catalog.Count > 4096;
+        foreach (var app in catalog.Take(4096))
+        {
+            if (app.Id.Length > 256 || app.Name.Length > 256 || app.Command.Length > 256 || app.ProcessName?.Length > 256) continue;
+            object item = new { id = app.Id, name = app.Name, cmd = app.Id, icon = app.Icon, process = app.ProcessName };
+            int itemBytes = JsonSerializer.SerializeToUtf8Bytes(item).Length;
+            if (chunk.Count > 0 && chunkBytes + itemBytes + 1 > targetBytes)
             {
-                id = monitor.Id,
-                name = $"Monitor {index + 1}",
-                width = monitor.Width,
-                height = monitor.Height,
-                x = monitor.X,
-                y = monitor.Y,
-                primary = monitor.Primary
-            }).ToArray(),
-            // Lista segura de aplicativos que o Mac pode pedir para abrir.
-            // `cmd` é o nome de campo esperado por mac/.../Protocol.swift.
-            apps = AppLauncher.GetKnownApps().Select(app => new
+                chunks.Add(chunk);
+                chunk = [];
+                chunkBytes = 64;
+            }
+            if (chunkBytes + itemBytes + 1 > targetBytes)
             {
-                id = app.Id,
-                name = app.Name,
-                cmd = app.Command,
-                icon = app.Icon
-            }).ToArray()
-        }, token).ConfigureAwait(false);
+                item = new { id = app.Id, name = app.Name, cmd = app.Id, icon = (string?)null, process = app.ProcessName };
+                itemBytes = JsonSerializer.SerializeToUtf8Bytes(item).Length;
+                if (chunkBytes + itemBytes + 1 > targetBytes) continue;
+            }
+            chunk.Add(item);
+            chunkBytes += itemBytes + 1;
+        }
+        if (chunk.Count > 0) chunks.Add(chunk);
+        if (chunks.Count == 0 && truncated) chunks.Add([]);
+
+        for (int index = 0; index < chunks.Count; index++)
+            await SendControlAsync(tls, new { type = "apps", index, total = chunks.Count, apps = chunks[index], truncated = truncated && index == chunks.Count - 1 }, token).ConfigureAwait(false);
     }
 
     private Task SendAuthFailedAsync(SslStream tls, string message, int retryAfterSeconds, CancellationToken token) =>

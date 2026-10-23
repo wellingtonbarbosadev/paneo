@@ -5,7 +5,7 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>pt</string>
 	<key>CFBundleDisplayName</key>
-	<string>remoteDesktop</string>
+	<string>Paneo</string>
 	<key>CFBundleExecutable</key>
 	<string>RemoteDesktop</string>
 	<key>CFBundleIconFile</key>
@@ -15,7 +15,7 @@
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>RemoteDesktop</string>
+	<string>Paneo</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
@@ -34,6 +34,10 @@
 	     acesso a rede local e a conexao com o PC falha com "No route to host". -->
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Conecta ao seu PC Windows na rede local para mostrar e controlar as janelas remotas.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_paneo._tcp</string>
+	</array>
 	<key>NSHumanReadableCopyright</key>
 	<string>Uso pessoal, sem garantia. Sem assinatura de desenvolvedor.</string>
 </dict>

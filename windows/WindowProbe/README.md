@@ -23,8 +23,8 @@ somente diagnósticos em memória; o único resultado persistido é o PNG pedido
 
 ## Fluxo técnico
 
-- EnumWindows filtra janelas de outros processos, visíveis, não minimizadas e
-  não ocultas pelo DWM.
+- EnumWindows filtra janelas de outros processos, visíveis e não ocultas pelo
+  DWM. Janelas minimizadas mantêm as dimensões normais na lista para restauração.
 - RoInitialize(MTA) é pareado com RoUninitialize na mesma thread. A thread
   aguarda todo o trabalho terminar, mantendo o apartamento ativo.
 - D3D11CreateDevice cria o dispositivo com BGRA; WARP é alternativa explícita
@@ -74,8 +74,16 @@ em portas diferentes, para conexões independentes no Mac.
 
 Somente a janela selecionada é capturada. Entrada exige que ela obtenha foco;
 cliques cobertos por outra janela são rejeitados. Não há suporte a aplicativos
-elevados, UAC, login, minimização, associação automática de diálogos ou sessão independente.
+elevados, UAC, login ou sessão independente.
 O computador local compartilha foco e cursor com o Mac.
+
+Clientes que negociam `windowCommands` podem minimizar, maximizar, restaurar e
+solicitar o fechamento normal do HWND da sessão. Minimizar pausa a captura e
+mantém a conexão para restaurar. O modo leitura guarda `WINDOWPLACEMENT` no host
+e restaura posição, tamanho e estado ao sair ou desconectar; apenas uma sessão
+por janela pode controlar esse modo. Menus Win32 padrão são publicados com IDs
+opacos por snapshot, até 128 itens e quatro níveis. Menus customizados recebem
+limitação explícita. Clientes antigos não recebem essas mensagens novas.
 
 `--stream-smoke caminho.json` captura 10 frames sintéticos e redimensiona a
 janela durante o teste. `--remote-smoke pasta` é exclusivamente de desenvolvimento:
@@ -88,7 +96,10 @@ considerar latência/codificação. WebRTC continua pendente no produto. Consult
 [pareamento e controles](../../docs/PAIRING-AND-CONTROLS.md) para limites e testes.
 
 `--real-app-soak pasta` abre documento descartável no Bloco de Notas e espera
-um cliente de teste; `scripts/test-real-app-soak.py` orquestra 30 minutos de
-transporte/rolagem. Não equivale a 30 minutos de uso manual AppKit nem à matriz
-de foco/DPI. `--input-interaction-smoke caminho.json` testa arraste/liberação
+um cliente de teste; `scripts/test-real-app-soak.py` orquestra 30 minutos com o
+bundle AppKit real, H.264 e checkpoints de continuidade, sem enviar entrada.
+Não equivale a 30 minutos de uso manual nem à matriz completa de foco/DPI.
+`--window-commands-smoke pasta` valida comandos/menus em uma janela descartável;
+`--application-compatibility-smoke pasta` executa a matriz opt-in de apps reais.
+`--input-interaction-smoke caminho.json` testa arraste/liberação
 e Unicode em janelas WPF sintéticas, incluindo perda de foco no PC.

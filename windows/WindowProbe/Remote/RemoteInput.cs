@@ -209,11 +209,11 @@ internal sealed class RemoteInput : IDisposable
     private static Input MouseEvent(uint flags, int data = 0, int data2 = 0) => new()
     { Type = 0, Value = new Payload { Mouse = new Mouse { Flags = flags, Data = unchecked((uint)data), Data2 = unchecked((uint)data2) } } };
 
-    public string? TryApply(JsonElement command)
+    public string? TryApply(JsonElement command, double inputScaleX = 1, double inputScaleY = 1)
     {
         lock (inputGate)
         {
-            try { ApplyCore(command); return null; }
+            try { ApplyCore(command, inputScaleX, inputScaleY); return null; }
             catch (InvalidOperationException ex) { ReleaseButton(); return ex.Message; }
             // Falha inesperada também não derruba a sessão: libera o botão e informa o Mac.
             catch { ReleaseButton(); return "Falha interna ao aplicar a entrada."; }
@@ -223,14 +223,14 @@ internal sealed class RemoteInput : IDisposable
     /// Move o cursor do PC para o ponto indicado sem enviar evento de botão.
     /// Aceita janela visível e ponto não coberto; não exige foco.
     /// </summary>
-    private void ApplyHover(JsonElement command)
+    private void ApplyHover(JsonElement command, double inputScaleX, double inputScaleY)
     {
         // O usuário pode desligar o hover quando está usando o PC ao mesmo
         // tempo: o cursor do Windows passaria a saltar para o Mac.
         if (!allowHover) return;
 
         double x = command.GetProperty("x").GetDouble(), y = command.GetProperty("y").GetDouble();
-        if (!double.IsFinite(x) || !double.IsFinite(y) || x < 0 || x >= 1 || y < 0 || y >= 1) return;
+        if (!VideoScaling.TryMapInput(x, y, inputScaleX, inputScaleY, out x, out y)) return;
         if (!MonitorMode && (!IsWindow(hwnd) || !IsWindowVisible(hwnd) || IsIconic(hwnd))) return;
 
         if (!TryGetViewport(out var rect)) return;
@@ -266,7 +266,7 @@ internal sealed class RemoteInput : IDisposable
         SetCursorPos(x, y);
     }
 
-    private void ApplyCore(JsonElement command)
+    private void ApplyCore(JsonElement command, double inputScaleX, double inputScaleY)
     {
         string? type = command.GetProperty("type").GetString();
         string? action = type == "pointer" ? command.GetProperty("action").GetString() : null;
@@ -279,7 +279,7 @@ internal sealed class RemoteInput : IDisposable
         {
             // Hover: move o ponteiro do PC sem clicar, sem exigir foco e sem
             // liberar botão nenhum. Recusa é silenciosa (não é entrada crítica).
-            ApplyHover(command);
+            ApplyHover(command, inputScaleX, inputScaleY);
             return;
         }
         if (type == "pointer" && action == "move")
@@ -303,7 +303,7 @@ internal sealed class RemoteInput : IDisposable
         if (type is "click" or "scroll" or "pointer")
         {
             double x = command.GetProperty("x").GetDouble(), y = command.GetProperty("y").GetDouble();
-            if (!double.IsFinite(x) || !double.IsFinite(y) || x < 0 || x >= 1 || y < 0 || y >= 1)
+            if (!VideoScaling.TryMapInput(x, y, inputScaleX, inputScaleY, out x, out y))
                 throw new InvalidOperationException("Coordenadas inválidas.");
             if (!TryGetViewport(out var rect)) throw new InvalidOperationException("Não foi possível obter os limites da janela.");
             var point = new Point { X = rect.L + (int)(x * (rect.R - rect.L)), Y = rect.T + (int)(y * (rect.B - rect.T)) };

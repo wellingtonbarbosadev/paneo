@@ -28,6 +28,7 @@ final class RemoteConnection: @unchecked Sendable {
     private var closed = false
     private var authenticated = false
     private var expectedFingerprint: String?
+    private var pinMismatch = false
     private var peerFingerprint: String?
     private var pin: String?
     private var deviceToken: Data?
@@ -38,6 +39,12 @@ final class RemoteConnection: @unchecked Sendable {
     private var heartbeat: DispatchSourceTimer?
     private var lastReceived = Date()
     private var pingStarted: UInt64?
+    private var requestedMaxDimension = 0
+    private var supportsWindowCommands = false
+    private var warnedPngScaling = false
+    private var appChunks: [RemoteApp] = []
+    private var appChunkTotal: Int?
+    private var nextAppChunkIndex = 0
 
     private let onState: @MainActor @Sendable (String, Bool) -> Void
     private let onFrame: @MainActor @Sendable (Data, Int, Int, UInt32) -> Void
@@ -49,7 +56,11 @@ final class RemoteConnection: @unchecked Sendable {
     private let onRoundTrip: @MainActor @Sendable (Double) -> Void
     private let onNotice: @MainActor @Sendable (String) -> Void
     private let onVideo: @MainActor @Sendable (String, Int, Int) -> Void
+    private let onVideoCapabilities: @MainActor @Sendable (Bool) -> Void
     private let onViewport: @MainActor @Sendable (Int, Int, Int, Int) -> Void
+    private let onWindowState: @MainActor @Sendable (RemoteWindowState) -> Void
+    private let onWindowCommandResult: @MainActor @Sendable (String, Bool, String?) -> Void
+    private let onWindowMenus: @MainActor @Sendable (RemoteWindowMenus) -> Void
     var onClipboard: (@MainActor @Sendable (String) -> Void)?
     var onFileReceived: (@MainActor @Sendable (String) -> Void)?
     var onAudio: (@MainActor @Sendable (Data) -> Void)?
@@ -63,8 +74,12 @@ final class RemoteConnection: @unchecked Sendable {
          onNotice: @escaping @MainActor @Sendable (String) -> Void,
          onVideo: @escaping @MainActor @Sendable (String, Int, Int) -> Void = { _, _, _ in },
          onViewport: @escaping @MainActor @Sendable (Int, Int, Int, Int) -> Void = { _, _, _, _ in },
+         onVideoCapabilities: @escaping @MainActor @Sendable (Bool) -> Void = { _ in },
          onMonitors: @escaping @MainActor @Sendable ([RemoteMonitor]) -> Void = { _ in },
-         onApps: @escaping @MainActor @Sendable ([RemoteApp]) -> Void = { _ in }) {
+         onApps: @escaping @MainActor @Sendable ([RemoteApp]) -> Void = { _ in },
+         onWindowState: @escaping @MainActor @Sendable (RemoteWindowState) -> Void = { _ in },
+         onWindowCommandResult: @escaping @MainActor @Sendable (String, Bool, String?) -> Void = { _, _, _ in },
+         onWindowMenus: @escaping @MainActor @Sendable (RemoteWindowMenus) -> Void = { _ in }) {
         self.onApps = onApps
         self.onMonitors = onMonitors
         self.onState = onState
@@ -75,7 +90,11 @@ final class RemoteConnection: @unchecked Sendable {
         self.onRoundTrip = onRoundTrip
         self.onNotice = onNotice
         self.onVideo = onVideo
+        self.onVideoCapabilities = onVideoCapabilities
         self.onViewport = onViewport
+        self.onWindowState = onWindowState
+        self.onWindowCommandResult = onWindowCommandResult
+        self.onWindowMenus = onWindowMenus
     }
 
     // MARK: - Ciclo de vida
@@ -117,6 +136,12 @@ final class RemoteConnection: @unchecked Sendable {
 
             self.deviceToken = savedToken
             expectedFingerprint = expected
+            pinMismatch = false
+            requestedMaxDimension = 0
+            warnedPngScaling = false
+            appChunks = []
+            appChunkTotal = nil
+            nextAppChunkIndex = 0
             lastReceived = Date()
 
             guard let nwPort = NWEndpoint.Port(rawValue: port), port != 0 else {
@@ -133,7 +158,9 @@ final class RemoteConnection: @unchecked Sendable {
                 guard let self else { complete(false); return }
                 let value = sec_trust_copy_ref(trust).takeRetainedValue()
                 if let expected = self.expectedFingerprint {
-                    complete(CertificatePin.matches(trust: value, expectedSHA256Hex: expected))
+                    let matches = CertificatePin.matches(trust: value, expectedSHA256Hex: expected)
+                    self.pinMismatch = !matches
+                    complete(matches)
                 } else {
                     self.peerFingerprint = Self.leafFingerprint(value)
                     complete(true)
@@ -149,15 +176,16 @@ final class RemoteConnection: @unchecked Sendable {
                     self.lastReceived = Date()
                     self.enqueue(Self.hello(role: role, windowId: windowId, monitorId: monitorId))
                     self.receive()
-                case .failed:
-                    // Com fingerprint configurado, a falha de TLS quase sempre
-                    // é certificado divergente: reconectar em loop não ajuda
-                    // e só polui a interface.
-                    if self.expectedFingerprint != nil {
-                        self.fail("Certificado do host diferente do esperado. Revogue o pareamento no Windows e pareia de novo.")
-                    } else {
-                        self.fail("Falha na conexão TLS. Confira endereço e porta.")
+                case let .waiting(error):
+                    // TLS fechado antes do handshake pode permanecer em waiting
+                    // indefinidamente; a reconexão da controladora recria a
+                    // sessão após o backoff. Erros de caminho seguem aguardando
+                    // mudança de rede como previsto pelo Network.framework.
+                    if case .tls = error {
+                        self.fail(RemoteConnectionFailure.message(pinMismatch: self.pinMismatch))
                     }
+                case .failed:
+                    self.fail(RemoteConnectionFailure.message(pinMismatch: self.pinMismatch))
                 case .cancelled:
                     self.fail("Conexão encerrada.")
                 default:
@@ -200,10 +228,32 @@ final class RemoteConnection: @unchecked Sendable {
     }
 
     /// Ajusta cadência e bitrate adaptativos.
-    func sendQuality(fps: Int, bitrate: Int) {
+    func sendQuality(fps: Int, bitrate: Int, maxDimension: Int = 0) {
         queue.async { [self] in
             guard !closed, authenticated else { return }
-            enqueue(OutgoingMessage.quality(fps: fps, bitrate: bitrate))
+            requestedMaxDimension = maxDimension
+            enqueue(OutgoingMessage.quality(fps: fps, bitrate: bitrate, maxDimension: maxDimension))
+        }
+    }
+
+    func sendWindowAction(_ action: String, enabled: Bool? = nil, width: Int? = nil, height: Int? = nil) {
+        queue.async { [self] in
+            guard !closed, authenticated, supportsWindowCommands else { return }
+            enqueue(OutgoingMessage.windowAction(action, enabled: enabled, width: width, height: height))
+        }
+    }
+
+    func requestWindowMenus() {
+        queue.async { [self] in
+            guard !closed, authenticated, supportsWindowCommands else { return }
+            enqueue(OutgoingMessage.windowMenus())
+        }
+    }
+
+    func invokeWindowMenu(id: String) {
+        queue.async { [self] in
+            guard !closed, authenticated, supportsWindowCommands else { return }
+            enqueue(OutgoingMessage.windowMenuInvoke(id: id))
         }
     }
 
@@ -270,7 +320,9 @@ final class RemoteConnection: @unchecked Sendable {
             "role": role,
             "windowId": windowId ?? NSNull(),
             "monitorId": monitorId ?? NSNull(),
-            "clientName": "Mac de \(shortHostname)"
+            "clientName": "Mac de \(shortHostname)",
+            "appCatalog": role == "control",
+            "windowCommands": role == "view"
         ]
         guard let json = try? JSONSerialization.data(withJSONObject: payload) else { return nil }
         return FrameCodec.control(json)
@@ -372,6 +424,10 @@ final class RemoteConnection: @unchecked Sendable {
             let codec = frame.codec
             let keyframe = frame.isKeyframe
             let ptsMs = frame.ptsMs
+            if codec == ProtocolV2.codecPng, requestedMaxDimension != 0, !warnedPngScaling {
+                warnedPngScaling = true
+                Task { @MainActor [onNotice] in onNotice("O Windows está usando PNG; o limite de resolução não se aplica neste modo.") }
+            }
             Task { @MainActor [onMedia, onFrame] in
                 onMedia(payload, codec, keyframe, width, height, ptsMs)
                 if codec == ProtocolV2.codecPng { onFrame(payload, width, height, sequence) }
@@ -399,7 +455,7 @@ final class RemoteConnection: @unchecked Sendable {
             guard authenticated else { throw ProtocolError.malformed }
             Task { @MainActor [onWindows, onMonitors, onApps] in
                 onMonitors(monitors)
-                onApps(apps)
+                if !apps.isEmpty { onApps(apps) }
                 onWindows(list)
             }
         case let .inputRejected(reason):
@@ -417,16 +473,49 @@ final class RemoteConnection: @unchecked Sendable {
             pingStarted = nil
             let milliseconds = Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
             Task { @MainActor [onRoundTrip] in onRoundTrip(milliseconds) }
-        case let .video(codec, width, height):
+        case let .video(codec, width, height, supportsScaling):
             // O host anuncia a geometria antes do primeiro quadro: usar isso
             // para ajustar a janela evita esperar o primeiro quadro chegar.
-            Task { @MainActor [onVideo] in onVideo(codec, width, height) }
+            if width > 0 && height > 0 {
+                Task { @MainActor [onVideo] in onVideo(codec, width, height) }
+            }
+            Task { @MainActor [onVideoCapabilities] in onVideoCapabilities(supportsScaling) }
+        case let .appsChunk(index, total, apps, truncated):
+            if index == 0 || appChunkTotal != total {
+                appChunks = []
+                appChunkTotal = total
+                nextAppChunkIndex = 0
+            }
+            guard index == nextAppChunkIndex else { throw ProtocolError.malformed }
+            appChunks.append(contentsOf: apps)
+            nextAppChunkIndex += 1
+            guard appChunks.count <= 4096 else { throw ProtocolError.tooLarge }
+            if index + 1 == total {
+                let snapshot = appChunks
+                appChunks = []
+                appChunkTotal = nil
+                nextAppChunkIndex = 0
+                if truncated {
+                    Task { @MainActor [onNotice] in onNotice("Catálogo limitado a 4096 aplicativos nesta sessão.") }
+                }
+                Task { @MainActor [onApps] in onApps(snapshot) }
+            }
         case let .viewport(x, y, width, height):
             Task { @MainActor [onViewport] in onViewport(x, y, width, height) }
         case let .clipboard(text):
             Task { @MainActor [onClipboard] in onClipboard?(text) }
         case let .fileReceived(name):
             Task { @MainActor [onFileReceived] in onFileReceived?(name) }
+        case let .windowState(state):
+            guard authenticated else { throw ProtocolError.malformed }
+            supportsWindowCommands = true
+            Task { @MainActor [onWindowState] in onWindowState(state) }
+        case let .windowCommandResult(action, success, message):
+            guard authenticated else { throw ProtocolError.malformed }
+            Task { @MainActor [onWindowCommandResult] in onWindowCommandResult(action, success, message) }
+        case let .windowMenus(menus):
+            guard authenticated else { throw ProtocolError.malformed }
+            Task { @MainActor [onWindowMenus] in onWindowMenus(menus) }
         }
     }
 

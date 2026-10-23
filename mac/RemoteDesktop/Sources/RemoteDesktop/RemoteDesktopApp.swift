@@ -28,6 +28,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var reconnectSmoke: ReconnectSmoke?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        AppSettings.shared.applyAppearance()
         let args = CommandLine.arguments
         if args.count == 4, args[1] == "--reconnect-smoke" {
             do { reconnectSmoke = try ReconnectSmoke(sessionPath: args[2], outputPath: args[3]) }
@@ -51,6 +52,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         windowControllers.append(controller)
         controller.showWindow()
+    }
+
+    @objc func showSettings(_ sender: Any?) {
+        let key = NSApp.keyWindow
+        let controller = windowControllers.first { $0.window === key } ?? windowControllers.first
+        controller?.showSettings()
     }
 
     /// ⌘⇧B: recolhe ou mostra a lista de apps da janela em foco.
