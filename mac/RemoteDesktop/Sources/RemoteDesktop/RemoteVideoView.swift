@@ -3,12 +3,14 @@ import AppKit
 /// Área de vídeo H.264: camada de apresentação do VideoToolbox, entrada remota
 /// (clique, arraste, rolagem, teclado) e hover (movimento do ponteiro do PC).
 @MainActor
-final class RemoteVideoView: NSView, @preconcurrency NSTextInputClient {
+final class RemoteVideoView: NSView, @preconcurrency NSTextInputClient, NSMenuItemValidation {
 
     /// Eventos de entrada enviada ao host.
     var send: ((RemoteInputEvent) -> Void)?
     var onDropFiles: (([URL]) -> Void)?
     var onBoundsChange: (() -> Void)?
+    var onZoomChange: (() -> Void)?
+    var allowsWindowZoom = false
 
     let decoder = H264Decoder()
     /// Fallback quando o Windows não tem encoder H.264.
@@ -22,6 +24,7 @@ final class RemoteVideoView: NSView, @preconcurrency NSTextInputClient {
     private var baseRect: CGRect?
     /// Área da view ocupada pelo quadro inteiro (view flipped, y para baixo).
     private var frameRect = CGRect.zero
+    private(set) var zoomScale: CGFloat = 1
     private final class StreamCoverView: NSView {
         override var isFlipped: Bool { true }
     }
@@ -445,6 +448,63 @@ final class RemoteVideoView: NSView, @preconcurrency NSTextInputClient {
         if delta != 0 { send?(.scroll(x: point.x, y: point.y, delta: delta)) }
     }
 
+    // MARK: - Escala da janela remota
+
+    var preferredWindowSize: NSSize {
+        NSSize(width: bounds.width / zoomScale, height: bounds.height / zoomScale)
+    }
+
+    func resetWindowZoom() {
+        zoomScale = 1
+        allowsWindowZoom = false
+    }
+
+    var canZoom: Bool {
+        allowsWindowZoom && onZoomChange != nil && !isTransitioning
+            && !isHiddenOrHasHiddenAncestor && pixelSize.width > 0 && pixelSize.height > 0
+            && window != nil && window?.attachedSheet == nil
+    }
+
+    @objc func zoomIn(_ sender: Any?) { setZoom(zoomScale + 0.1) }
+    @objc func zoomOut(_ sender: Any?) { setZoom(zoomScale - 0.1) }
+    @objc func resetZoom(_ sender: Any?) { setZoom(1) }
+
+    func setZoom(_ scale: CGFloat) {
+        guard canZoom, scale.isFinite else { return }
+        let next = min(3, max(0.5, (scale * 10).rounded() / 10))
+        guard next != zoomScale || scale == 1 else { return }
+        resetInput()
+        zoomScale = next
+        onZoomChange?()
+    }
+
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        guard canZoom else { return false }
+        switch menuItem.action {
+        case #selector(zoomIn(_:)): return zoomScale < 3
+        case #selector(zoomOut(_:)): return zoomScale > 0.5
+        default: return true
+        }
+    }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if handleZoomShortcut(event) { return true }
+        return super.performKeyEquivalent(with: event)
+    }
+
+    private func handleZoomShortcut(_ event: NSEvent) -> Bool {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        guard window?.firstResponder === self, flags.contains(.command),
+              !flags.contains(.control), !flags.contains(.option) else { return false }
+        switch event.charactersIgnoringModifiers {
+        case "+", "=": zoomIn(nil)
+        case "-": zoomOut(nil)
+        case "0": resetZoom(nil)
+        default: return false
+        }
+        return true
+    }
+
     // MARK: - Teclado e Gestos
 
     var onSwipe: ((CGFloat) -> Void)?
@@ -458,6 +518,7 @@ final class RemoteVideoView: NSView, @preconcurrency NSTextInputClient {
     }
 
     override func keyDown(with event: NSEvent) {
+        if handleZoomShortcut(event) { return }
         let flags = event.modifierFlags
 
         // Atalhos com Command (⌘):

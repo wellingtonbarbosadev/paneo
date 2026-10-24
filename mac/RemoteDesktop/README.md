@@ -39,6 +39,18 @@ Temas, barra nas quatro bordas, densidades, favoritos e janelas destacadas
 continuam disponíveis. A engrenagem e ⌘, abrem Ajustes em popup modal sobre a janela principal;
 Fechar/Esc devolve o foco ao formulário ou workspace. ⌘K abre a busca.
 
+**Visualizar → Aumentar/Diminuir Zoom** muda o tamanho aparente da janela Windows
+inteira, incluindo fontes, menus e botões. ⌘+ (ou ⌘=) aumenta, ⌘− diminui e ⌘0
+restaura o encaixe padrão (100%). Aumentar pede uma janela menor no PC, com
+menos espaço para conteúdo; diminuir pede uma janela maior, com mais espaço.
+O vídeo continua encaixado por inteiro, sem recorte para ampliar a imagem.
+Usar zoom ativa o ajuste automático somente na janela atual, inclusive nas
+destacadas; a preferência salva não muda. A faixa solicitada é de 50% a 300%,
+em passos de 10%, limitada pelo tamanho mínimo do aplicativo e pela área útil
+do monitor do PC. Janelas fixas, monitores e hosts sem ajuste de janela deixam
+o zoom indisponível. A escala volta a 100% ao selecionar outra janela e não é
+salva entre execuções. Toda rolagem continua sendo enviada ao Windows.
+
 O botão **Janela** controla a janela Windows selecionada: minimizar,
 maximizar/restaurar e solicitar o fechamento normal. Os botões nativos do Mac
 continuam controlando apenas o visualizador. Uma janela minimizada mantém seu
@@ -75,6 +87,7 @@ mac/RemoteDesktop/Scripts/test-settings.sh
 mac/RemoteDesktop/Scripts/test-stream-controls.sh
 mac/RemoteDesktop/Scripts/test-window-commands.sh
 mac/RemoteDesktop/Scripts/test-cursor-interaction.sh
+mac/RemoteDesktop/Scripts/test-zoom.sh
 python3 scripts/test-mac-transport.py
 python3 scripts/test-mac-reconnect.py
 ```

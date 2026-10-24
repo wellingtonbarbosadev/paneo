@@ -142,6 +142,7 @@ final class RemoteWindowController: NSObject, NSWindowDelegate {
 
         videoView.send = { [weak self] event in self?.connection?.send(event) }
         videoView.onBoundsChange = { [weak self] in self?.scheduleReadingResize() }
+        videoView.onZoomChange = { [weak self] in self?.sendWindowAction("reading", enabled: true) }
         windowActionsView.update(state: nil, windowId: target.id, isMonitor: target.isMonitor,
                                  autoFitEnabled: autoFitEnabled)
         windowActionsView.onAction = { [weak self] action, enabled in self?.sendWindowAction(action, enabled: enabled) }
@@ -190,6 +191,7 @@ final class RemoteWindowController: NSObject, NSWindowDelegate {
                     self.videoView.resetInput()
                     self.connection = nil
                     self.remoteWindowState = nil
+                    self.videoView.allowsWindowZoom = false
                     self.lastReadingSize = nil
                     self.windowActionsView.update(state: nil, windowId: self.target.id, isMonitor: self.target.isMonitor,
                                                   autoFitEnabled: self.autoFitEnabled)
@@ -249,6 +251,7 @@ final class RemoteWindowController: NSObject, NSWindowDelegate {
             onWindowState: { [weak self] state in
                 guard let self, self.generation == current, state.windowId == self.target.id else { return }
                 self.remoteWindowState = state
+                self.videoView.allowsWindowZoom = state.canResize && !state.minimized && !self.target.isMonitor
                 self.windowActionsView.update(state: state, windowId: self.target.id, isMonitor: self.target.isMonitor,
                                               autoFitEnabled: self.autoFitEnabled)
                 self.videoView.resetInput()
@@ -271,6 +274,7 @@ final class RemoteWindowController: NSObject, NSWindowDelegate {
                 if !success {
                     if action == "reading" {
                         self.autoFitEnabled = false
+                        self.videoView.allowsWindowZoom = false
                         self.readingResizeTask?.cancel()
                         self.windowActionsView.update(state: self.remoteWindowState, windowId: self.target.id,
                                                       isMonitor: self.target.isMonitor,
@@ -349,6 +353,7 @@ final class RemoteWindowController: NSObject, NSWindowDelegate {
 
     private func resetRemoteWindowState() {
         remoteWindowState = nil
+        videoView.allowsWindowZoom = false
         readingResizeTask?.cancel()
         readingResizeTask = nil
         lastReadingSize = nil
@@ -406,7 +411,8 @@ final class RemoteWindowController: NSObject, NSWindowDelegate {
                   !self.target.isMonitor, self.remoteWindowState?.canResize == true,
                   self.remoteWindowState?.minimized != true,
                   let connection = self.connection else { return }
-            let size = (Int(self.videoView.bounds.width.rounded()), Int(self.videoView.bounds.height.rounded()))
+            let preferred = self.videoView.preferredWindowSize
+            let size = (Int(preferred.width.rounded()), Int(preferred.height.rounded()))
             guard size.0 > 0, size.1 > 0 else { return }
             guard self.lastReadingSize?.0 != size.0 || self.lastReadingSize?.1 != size.1 else { return }
             self.lastReadingSize = size

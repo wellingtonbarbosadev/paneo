@@ -328,6 +328,7 @@ final class MainWindowController: NSObject, NSWindowDelegate {
         thumbnailBar.onShowQuality = { [weak self] source in self?.showStreamControls(from: source) }
         windowActionsView.onAction = { [weak self] action, enabled in self?.sendWindowAction(action, enabled: enabled) }
         videoView.onBoundsChange = { [weak self] in self?.scheduleReadingResize() }
+        videoView.onZoomChange = { [weak self] in self?.sendWindowAction("reading", enabled: true) }
         windowActionsView.onRequestMenus = { [weak self] in self?.viewConnection?.requestWindowMenus() }
         windowActionsView.onInvokeMenu = { [weak self] id in self?.viewConnection?.invokeWindowMenu(id: id) }
         windowActionsView.onMenuOpen = { [weak self] in
@@ -625,7 +626,8 @@ final class MainWindowController: NSObject, NSWindowDelegate {
                   self.remoteWindowState?.canResize == true,
                   self.remoteWindowState?.minimized != true,
                   let connection = self.viewConnection else { return }
-            let size = (Int(self.videoView.bounds.width.rounded()), Int(self.videoView.bounds.height.rounded()))
+            let preferred = self.videoView.preferredWindowSize
+            let size = (Int(preferred.width.rounded()), Int(preferred.height.rounded()))
             guard size.0 > 0, size.1 > 0 else { return }
             guard self.lastReadingSize?.0 != size.0 || self.lastReadingSize?.1 != size.1 else { return }
             self.lastReadingSize = size
@@ -634,6 +636,7 @@ final class MainWindowController: NSObject, NSWindowDelegate {
     }
 
     private func applyRemoteWindowState(_ state: RemoteWindowState, target: RemoteWindow) {
+        videoView.allowsWindowZoom = state.canResize && !state.minimized && !target.isMonitor
         if let index = windows.firstIndex(where: { $0.id == state.windowId }) {
             windows[index].minimized = state.minimized
             refreshBar()
@@ -1277,6 +1280,7 @@ final class MainWindowController: NSObject, NSWindowDelegate {
     // MARK: - Alternância de Aplicativos (App Switcher)
 
     private func select(window target: RemoteWindow) {
+        let preserveZoom = selectedWindow?.id == target.id || pendingReconnectTarget?.id == target.id
         pendingFavoriteLaunch = nil
         pendingReconnectTarget = nil
         cancelStreamRetry()
@@ -1305,6 +1309,7 @@ final class MainWindowController: NSObject, NSWindowDelegate {
 
         // Fecha a conexão de streaming anterior
         closeActiveViewSession()
+        if !preserveZoom { videoView.resetWindowZoom() }
 
         selectedWindow = target
         remoteWindowState = nil
@@ -1360,6 +1365,7 @@ final class MainWindowController: NSObject, NSWindowDelegate {
                     self.videoView.resetInput()
                     self.viewConnection = nil
                     self.remoteWindowState = nil
+                    self.videoView.allowsWindowZoom = false
                     self.lastReadingSize = nil
                     self.readingResizeTask?.cancel()
                     self.windowActionsView.update(state: nil, windowId: target.id, isMonitor: target.isMonitor,
@@ -1447,6 +1453,7 @@ final class MainWindowController: NSObject, NSWindowDelegate {
                 if !success {
                     if action == "reading" {
                         self.autoFitEnabled = false
+                        self.videoView.allowsWindowZoom = false
                         self.readingResizeTask?.cancel()
                         self.windowActionsView.update(state: self.remoteWindowState, windowId: target.id,
                                                       isMonitor: target.isMonitor,
@@ -1508,6 +1515,7 @@ final class MainWindowController: NSObject, NSWindowDelegate {
         viewConnection?.disconnect()
         viewConnection = nil
         remoteWindowState = nil
+        videoView.allowsWindowZoom = false
         restoreOnInitialWindowState = false
         readingResizeTask?.cancel()
         readingResizeTask = nil
