@@ -62,8 +62,15 @@ vídeo. Hosts antigos deixam os novos controles indisponíveis.
 
 ## Validação
 
+Na troca de apps, o quadro anterior permanece estável enquanto o novo fluxo
+prepara a imagem e a geometria. Uma transição breve revela o vídeo pronto,
+respeitando Reduzir Movimento. A entrada remota aguarda essa revelação.
+O primeiro ajuste automático é enviado sem o debounce usado durante resize.
+
 ```sh
 mac/RemoteDesktop/Scripts/test-customization.sh
+python3 mac/RemoteDesktop/Scripts/test-app-switch.py
+mac/RemoteDesktop/Scripts/test-stream-decoder.sh artifacts/video-media.bin
 mac/RemoteDesktop/Scripts/test-settings.sh
 mac/RemoteDesktop/Scripts/test-stream-controls.sh
 mac/RemoteDesktop/Scripts/test-window-commands.sh
@@ -71,6 +78,10 @@ mac/RemoteDesktop/Scripts/test-cursor-interaction.sh
 python3 scripts/test-mac-transport.py
 python3 scripts/test-mac-reconnect.py
 ```
+
+O teste de decoder requer um arquivo de mídia H.264 com duas sequências de
+keyframes; `artifacts/video-media.bin` é uma fixture local, não versionada.
+Passe o caminho de uma captura de teste equivalente quando ela não existir.
 
 Os harnesses usam preferências/credenciais sintéticas, sem o pareamento real.
 A fixture local não comprova captura nem entrada Windows; essas exigem sessão

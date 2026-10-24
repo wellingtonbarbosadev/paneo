@@ -22,6 +22,15 @@ final class RemoteVideoView: NSView, @preconcurrency NSTextInputClient {
     private var baseRect: CGRect?
     /// Área da view ocupada pelo quadro inteiro (view flipped, y para baixo).
     private var frameRect = CGRect.zero
+    private final class StreamCoverView: NSView {
+        override var isFlipped: Bool { true }
+    }
+    private let streamCover = StreamCoverView()
+    private let streamCoverImage = CALayer()
+    private(set) var isTransitioning = false
+    private var streamHasFrame = false
+    private var streamGeneration = UUID()
+    private var streamRevealTask: Task<Void, Never>?
 
     private var pressed: RemoteMouseButton?
     private var lastPoint = NSPoint.zero
@@ -60,6 +69,12 @@ final class RemoteVideoView: NSView, @preconcurrency NSTextInputClient {
         layer?.addSublayer(pngLayer)
         layer?.addSublayer(decoder.displayLayer)
         layer?.addSublayer(jpegDecoder.displayLayer)
+        streamCover.wantsLayer = true
+        streamCover.layer?.backgroundColor = NSColor.black.cgColor
+        streamCover.layer?.addSublayer(streamCoverImage)
+        streamCoverImage.contentsGravity = .resizeAspect
+        streamCover.isHidden = true
+        addSubview(streamCover)
         decoder.onNeedKeyframe = { [weak self] in self?.send?(.needKeyframe) }
         decoder.onThumbnail = { [weak self] cg in self?.onThumbnail?(cg) }
         decoder.onResolution = { [weak self] width, height in
@@ -68,6 +83,8 @@ final class RemoteVideoView: NSView, @preconcurrency NSTextInputClient {
             self.jpegDecoder.displayLayer.isHidden = true
             self.decoder.displayLayer.isHidden = false
             self.pixelSize = CGSize(width: width, height: height)
+            self.streamHasFrame = false
+            self.scheduleStreamReveal()
             self.needsLayout = true
             self.onResolution?(width, height)
         }
@@ -80,11 +97,13 @@ final class RemoteVideoView: NSView, @preconcurrency NSTextInputClient {
                 self.decoder.displayLayer.isHidden = false
                 CATransaction.commit()
             }
+            self.streamFrameReady()
         }
         registerForDraggedTypes([.fileURL])
     }
 
     override func draggingEntered(_ sender: any NSDraggingInfo) -> NSDragOperation {
+        guard !isTransitioning else { return [] }
         if sender.draggingPasteboard.canReadObject(forClasses: [NSURL.self], options: nil) {
             return .copy
         }
@@ -92,10 +111,11 @@ final class RemoteVideoView: NSView, @preconcurrency NSTextInputClient {
     }
 
     override func draggingUpdated(_ sender: any NSDraggingInfo) -> NSDragOperation {
-        return .copy
+        return isTransitioning ? [] : .copy
     }
 
     override func performDragOperation(_ sender: any NSDraggingInfo) -> Bool {
+        guard !isTransitioning else { return false }
         guard let urls = sender.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: nil) as? [URL], !urls.isEmpty else {
             return false
         }
@@ -113,10 +133,71 @@ final class RemoteVideoView: NSView, @preconcurrency NSTextInputClient {
     var onThumbnail: ((CGImage) -> Void)?
 
     func captureSnapshot() -> CGImage? {
+        if !jpegDecoder.displayLayer.isHidden {
+            return jpegDecoder.displayLayer.contents.map { $0 as! CGImage }
+        }
         if !pngLayer.isHidden, let last = lastPngImage {
             return last
         }
         return decoder.captureSnapshot()
+    }
+
+    func beginStreamTransition() {
+        resetInput()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        defer { CATransaction.commit() }
+        if !isTransitioning {
+            streamCoverImage.contents = captureSnapshot()
+            streamCoverImage.frame = frameRect
+        }
+        streamGeneration = UUID()
+        streamRevealTask?.cancel()
+        streamCover.layer?.removeAllAnimations()
+        streamCover.alphaValue = 1
+        streamCover.isHidden = false
+        isTransitioning = true
+        streamHasFrame = false
+        decoder.beginStream()
+        pixelSize = .zero
+        baseRect = nil
+        lastPngImage = nil
+        pngLayer.contents = nil
+        pngLayer.isHidden = true
+        decoder.displayLayer.isHidden = true
+        jpegDecoder.displayLayer.contents = nil
+        jpegDecoder.displayLayer.isHidden = true
+        needsLayout = true
+        restoreCursor()
+    }
+
+    private func streamFrameReady() {
+        guard isTransitioning, !streamHasFrame else { return }
+        streamHasFrame = true
+        scheduleStreamReveal()
+    }
+
+    private func scheduleStreamReveal() {
+        guard isTransitioning else { return }
+        streamGeneration = UUID()
+        streamRevealTask?.cancel()
+        streamCover.layer?.removeAllAnimations()
+        streamCover.alphaValue = 1
+        guard streamHasFrame else { return }
+        let current = streamGeneration
+        streamRevealTask = Task { [weak self] in
+            // Encobre o primeiro ajuste de geometria, sem esperar a cadência do vídeo.
+            try? await Task.sleep(for: .milliseconds(120))
+            guard !Task.isCancelled, let self, self.streamGeneration == current else { return }
+            self.layoutSubtreeIfNeeded()
+            AppMotion.animate({ self.streamCover.animator().alphaValue = 0 }) { [weak self] in
+                guard let self, self.streamGeneration == current else { return }
+                self.streamCover.isHidden = true
+                self.streamCoverImage.contents = nil
+                self.isTransitioning = false
+                self.restoreCursor()
+            }
+        }
     }
 
     func presentPng(_ data: Data, width: Int, height: Int) {
@@ -135,29 +216,37 @@ final class RemoteVideoView: NSView, @preconcurrency NSTextInputClient {
             pixelSize = CGSize(width: width, height: height)
             needsLayout = true
             onResolution?(width, height)
+            scheduleStreamReveal()
         }
+        streamFrameReady()
     }
 
     /// Fallback JPEG: usado quando o Windows não tem encoder H.264.
     func presentJpeg(_ data: Data, width: Int, height: Int) {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
+        guard jpegDecoder.decode(data) else { CATransaction.commit(); return }
         pngLayer.isHidden = true
         decoder.displayLayer.isHidden = true
         jpegDecoder.displayLayer.isHidden = false
+        jpegDecoder.displayLayer.frame = frameRect
         CATransaction.commit()
-        jpegDecoder.decode(data)
         if pixelSize.width != CGFloat(width) || pixelSize.height != CGFloat(height) {
             pixelSize = CGSize(width: width, height: height)
             needsLayout = true
             onResolution?(width, height)
+            scheduleStreamReveal()
         }
+        streamFrameReady()
     }
 
     /// Define onde a janela fica dentro do quadro (mensagem `viewport` do host).
     func setBaseRect(x: Int, y: Int, width: Int, height: Int) {
-        baseRect = width > 0 && height > 0
+        let rect: CGRect? = width > 0 && height > 0
             ? CGRect(x: x, y: y, width: width, height: height) : nil
+        guard baseRect != rect else { return }
+        baseRect = rect
+        scheduleStreamReveal()
         needsLayout = true
         window?.invalidateCursorRects(for: self)
     }
@@ -180,6 +269,7 @@ final class RemoteVideoView: NSView, @preconcurrency NSTextInputClient {
 
     override func layout() {
         super.layout()
+        streamCover.frame = bounds
         updateFrameRect()
         CATransaction.begin()
         CATransaction.setDisableActions(true)
@@ -194,6 +284,7 @@ final class RemoteVideoView: NSView, @preconcurrency NSTextInputClient {
     override func resetCursorRects() {
         super.resetCursorRects()
         guard let window, window.isKeyWindow, !isHiddenOrHasHiddenAncestor,
+              !isTransitioning,
               pixelSize.width > 0, pixelSize.height > 0 else { return }
         for rect in RemoteVideoInteraction.cursorRects(frameRect: frameRect,
                                                         bounds: bounds,
@@ -210,7 +301,7 @@ final class RemoteVideoView: NSView, @preconcurrency NSTextInputClient {
 
     /// Política geométrica usada para conferir a região de interação nos testes.
     func cursorShouldHide(at point: CGPoint) -> Bool {
-        guard !isHiddenOrHasHiddenAncestor, pixelSize.width > 0, pixelSize.height > 0 else { return false }
+        guard !isTransitioning, !isHiddenOrHasHiddenAncestor, pixelSize.width > 0, pixelSize.height > 0 else { return false }
         return RemoteVideoInteraction.contains(point, in: frameRect, bounds: bounds,
                                                visibleRect: visibleRect,
                                                exclusions: interactionExclusions)
@@ -259,6 +350,7 @@ final class RemoteVideoView: NSView, @preconcurrency NSTextInputClient {
     // MARK: - Coordenadas
 
     private func point(for event: NSEvent) -> NSPoint? {
+        guard !isTransitioning else { return nil }
         let location = convert(event.locationInWindow, from: nil)
         guard RemoteVideoInteraction.contains(location, in: frameRect, bounds: bounds,
                                                visibleRect: visibleRect,
@@ -388,6 +480,7 @@ final class RemoteVideoView: NSView, @preconcurrency NSTextInputClient {
             }
 
             // Tradução ⌘ -> Ctrl para o Windows (⌘C -> Ctrl+C, ⌘V -> Ctrl+V, ⌘A -> Ctrl+A, etc.)
+            guard !isTransitioning else { return }
             let alt = flags.contains(.option)
             let shift = flags.contains(.shift)
 
@@ -414,6 +507,7 @@ final class RemoteVideoView: NSView, @preconcurrency NSTextInputClient {
             return
         }
 
+        guard !isTransitioning else { return }
         if hasMarkedText() { interpretKeyEvents([event]); return }
         let ctrl = flags.contains(.control), alt = flags.contains(.option), shift = flags.contains(.shift)
         let keys: [UInt16: RemoteKey] = [36: .enter, 76: .enter, 51: .backspace, 48: .tab, 53: .escape, 123: .left, 124: .right, 125: .down, 126: .up, 117: .delete, 115: .home, 119: .end, 116: .pageup, 121: .pagedown, 114: .insert, 122: .f1, 120: .f2, 99: .f3, 118: .f4, 96: .f5, 97: .f6, 98: .f7, 100: .f8, 101: .f9, 109: .f10, 103: .f11, 111: .f12]
@@ -427,7 +521,7 @@ final class RemoteVideoView: NSView, @preconcurrency NSTextInputClient {
     func insertText(_ string: Any, replacementRange: NSRange) {
         let text = (string as? NSAttributedString)?.string ?? (string as? String ?? "")
         clearMarkedText()
-        if !text.isEmpty { send?(.text(text)) }
+        if !isTransitioning, !text.isEmpty { send?(.text(text)) }
     }
 
     func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
@@ -443,7 +537,7 @@ final class RemoteVideoView: NSView, @preconcurrency NSTextInputClient {
     func unmarkText() {
         let text = marked.string
         clearMarkedText()
-        if !text.isEmpty { send?(.text(text)) }
+        if !isTransitioning, !text.isEmpty { send?(.text(text)) }
     }
 
     func selectedRange() -> NSRange { selection }

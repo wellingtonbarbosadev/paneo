@@ -118,6 +118,7 @@ final class H264Decoder {
     var onThumbnail: ((CGImage) -> Void)?
     private var lastThumbnailTime: TimeInterval = 0
     private var lastImageBuffer: CVImageBuffer?
+    private var generation = UUID()
 
     init() {
         displayLayer.videoGravity = .resizeAspect
@@ -170,10 +171,12 @@ final class H264Decoder {
         guard let sample = makeSampleBuffer(payload: payload, ptsMs: ptsMs) else { return }
 
         var flags = VTDecodeInfoFlags()
+        let current = generation
         let status = VTDecompressionSessionDecodeFrame(session!, sampleBuffer: sample, flags: [], infoFlagsOut: &flags) { [weak self] status, _, imageBuffer, _, _ in
             guard let self else { return }
             if status != noErr {
                 Task { @MainActor in
+                    guard self.generation == current else { return }
                     self.awaitingKeyframe = true
                     self.displayLayer.flush()
                     self.requestKeyframe()
@@ -186,6 +189,7 @@ final class H264Decoder {
             // VideoToolbox não pode atravessar o isolamento por conta própria.
             let box = imageBuffer.map { SendablePixelBuffer(buffer: $0) }
             Task { @MainActor in
+                guard self.generation == current else { return }
                 if let box {
                     self.enqueue(pixelBuffer: box)
                     self.onDecoded?(self.pixelSize)
@@ -286,6 +290,20 @@ final class H264Decoder {
         requestKeyframe()
     }
 
+    /// Cada app tem referências H.264 próprias, mesmo quando usa o mesmo tamanho.
+    func beginStream() {
+        invalidateSession()
+        format = nil
+        sequenceParameterSet = nil
+        pictureParameterSet = nil
+        awaitingKeyframe = true
+        pixelSize = .zero
+        lastImageBuffer = nil
+        lastThumbnailTime = 0
+        lastKeyframeRequest = .distantPast
+        displayLayer.flushAndRemoveImage()
+    }
+
     private func requestKeyframe() {
         let now = Date()
         guard now.timeIntervalSince(lastKeyframeRequest) > 1 else { return }
@@ -366,6 +384,7 @@ final class H264Decoder {
 
     /// <summary>Invalida a sessão atual (evita acumular sessões em resize).</summary>
     private func invalidateSession() {
+        generation = UUID()
         if let session {
             VTDecompressionSessionInvalidate(session)
         }

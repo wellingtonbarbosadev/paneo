@@ -1337,7 +1337,7 @@ final class MainWindowController: NSObject, NSWindowDelegate {
 
         viewGeneration = UUID()
         let current = viewGeneration
-        videoView.setBaseRect(x: 0, y: 0, width: 0, height: 0)
+        videoView.beginStreamTransition()
 
         sampleStart = ProcessInfo.processInfo.systemUptime
         sampleFrames = 0
@@ -1440,7 +1440,7 @@ final class MainWindowController: NSObject, NSWindowDelegate {
                     self.restoreOnInitialWindowState = false
                     if state.minimized { self.viewConnection?.sendWindowAction("restore") }
                 }
-                if !state.minimized { self.scheduleReadingResize() }
+                if !state.minimized { self.scheduleReadingResize(debounce: self.lastReadingSize != nil) }
             },
             onWindowCommandResult: { [weak self] action, success, message in
                 guard let self, self.viewGeneration == current else { return }

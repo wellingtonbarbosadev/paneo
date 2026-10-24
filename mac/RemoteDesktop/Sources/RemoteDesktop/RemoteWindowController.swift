@@ -174,6 +174,7 @@ final class RemoteWindowController: NSObject, NSWindowDelegate {
     private func connect() {
         generation = UUID()
         let current = generation
+        videoView.beginStreamTransition()
 
         let client = RemoteConnection(
             onState: { [weak self] message, ready in
@@ -263,7 +264,7 @@ final class RemoteWindowController: NSObject, NSWindowDelegate {
                     self.restoreOnInitialWindowState = false
                     if state.minimized { self.connection?.sendWindowAction("restore") }
                 }
-                if !state.minimized { self.scheduleReadingResize() }
+                if !state.minimized { self.scheduleReadingResize(debounce: self.lastReadingSize != nil) }
             },
             onWindowCommandResult: { [weak self] action, success, message in
                 guard let self, self.generation == current else { return }
