@@ -8,9 +8,10 @@ Desktop.ini
 /.tools/
 /artifacts/
 
-# Documentação local (manter apenas README.md) e scripts auxiliares
+# Documentação local (preservar READMEs públicos) e scripts auxiliares
 *.md
 !README.md
+!/README.en-US.md
 /scripts/
 /experiments/
 
