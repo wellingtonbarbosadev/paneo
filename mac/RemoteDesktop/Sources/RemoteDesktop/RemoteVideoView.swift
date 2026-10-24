@@ -10,27 +10,34 @@ final class RemoteVideoView: NSView, @preconcurrency NSTextInputClient, NSMenuIt
     var onDropFiles: (([URL]) -> Void)?
     var onBoundsChange: (() -> Void)?
     var onZoomChange: (() -> Void)?
-    var allowsWindowZoom = false
+    var onZoomStateChange: (() -> Void)?
+    var allowsWindowZoom = false {
+        didSet {
+            if !allowsWindowZoom { cancelZoomTransition() }
+            onZoomStateChange?()
+        }
+    }
 
     let decoder = H264Decoder()
     /// Fallback quando o Windows não tem encoder H.264.
     let jpegDecoder = JpegDecoder()
     private let pngLayer = CALayer()
     private var lastPngImage: CGImage?
-    private(set) var pixelSize = CGSize.zero
+    private(set) var pixelSize = CGSize.zero { didSet { onZoomStateChange?() } }
     /// Retângulo da janela autorizada dentro do quadro (pixels do quadro).
     /// Quando um popup expande o quadro, a escala da janela fica estável e o
     /// popup aparece além da borda dela.
     private var baseRect: CGRect?
     /// Área da view ocupada pelo quadro inteiro (view flipped, y para baixo).
     private var frameRect = CGRect.zero
-    private(set) var zoomScale: CGFloat = 1
+    private(set) var zoomScale: CGFloat = 1 { didSet { onZoomStateChange?() } }
     private final class StreamCoverView: NSView {
         override var isFlipped: Bool { true }
     }
     private let streamCover = StreamCoverView()
     private let streamCoverImage = CALayer()
-    private(set) var isTransitioning = false
+    private(set) var isTransitioning = false { didSet { onZoomStateChange?() } }
+    private var isZoomTransition = false
     private var streamHasFrame = false
     private var streamGeneration = UUID()
     private var streamRevealTask: Task<Void, Never>?
@@ -146,6 +153,49 @@ final class RemoteVideoView: NSView, @preconcurrency NSTextInputClient, NSMenuIt
     }
 
     func beginStreamTransition() {
+        isZoomTransition = false
+        coverCurrentFrame()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        defer { CATransaction.commit() }
+        decoder.beginStream()
+        pixelSize = .zero
+        baseRect = nil
+        lastPngImage = nil
+        pngLayer.contents = nil
+        pngLayer.isHidden = true
+        decoder.displayLayer.isHidden = true
+        jpegDecoder.displayLayer.contents = nil
+        jpegDecoder.displayLayer.isHidden = true
+        needsLayout = true
+        restoreCursor()
+    }
+
+    func beginZoomTransition() {
+        guard AppMotion.duration > 0, !isTransitioning || isZoomTransition else { return }
+        isZoomTransition = true
+        coverCurrentFrame()
+        let current = streamGeneration
+        streamRevealTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(1))
+            guard !Task.isCancelled, let self, self.streamGeneration == current else { return }
+            self.cancelZoomTransition()
+        }
+    }
+
+    func cancelZoomTransition() {
+        guard isZoomTransition else { return }
+        streamRevealTask?.cancel()
+        streamGeneration = UUID()
+        streamCover.layer?.removeAllAnimations()
+        streamCover.isHidden = true
+        streamCoverImage.contents = nil
+        isTransitioning = false
+        isZoomTransition = false
+        restoreCursor()
+    }
+
+    private func coverCurrentFrame() {
         resetInput()
         CATransaction.begin()
         CATransaction.setDisableActions(true)
@@ -161,16 +211,6 @@ final class RemoteVideoView: NSView, @preconcurrency NSTextInputClient, NSMenuIt
         streamCover.isHidden = false
         isTransitioning = true
         streamHasFrame = false
-        decoder.beginStream()
-        pixelSize = .zero
-        baseRect = nil
-        lastPngImage = nil
-        pngLayer.contents = nil
-        pngLayer.isHidden = true
-        decoder.displayLayer.isHidden = true
-        jpegDecoder.displayLayer.contents = nil
-        jpegDecoder.displayLayer.isHidden = true
-        needsLayout = true
         restoreCursor()
     }
 
@@ -198,6 +238,7 @@ final class RemoteVideoView: NSView, @preconcurrency NSTextInputClient, NSMenuIt
                 self.streamCover.isHidden = true
                 self.streamCoverImage.contents = nil
                 self.isTransitioning = false
+                self.isZoomTransition = false
                 self.restoreCursor()
             }
         }
@@ -348,6 +389,18 @@ final class RemoteVideoView: NSView, @preconcurrency NSTextInputClient, NSMenuIt
         } else {
             restoreCursor()
         }
+        onZoomStateChange?()
+    }
+
+    override func viewDidHide() {
+        super.viewDidHide()
+        cancelZoomTransition()
+        onZoomStateChange?()
+    }
+
+    override func viewDidUnhide() {
+        super.viewDidUnhide()
+        onZoomStateChange?()
     }
 
     // MARK: - Coordenadas
@@ -460,7 +513,7 @@ final class RemoteVideoView: NSView, @preconcurrency NSTextInputClient, NSMenuIt
     }
 
     var canZoom: Bool {
-        allowsWindowZoom && onZoomChange != nil && !isTransitioning
+        allowsWindowZoom && onZoomChange != nil && (!isTransitioning || isZoomTransition)
             && !isHiddenOrHasHiddenAncestor && pixelSize.width > 0 && pixelSize.height > 0
             && window != nil && window?.attachedSheet == nil
     }

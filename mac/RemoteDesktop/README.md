@@ -39,6 +39,12 @@ Temas, barra nas quatro bordas, densidades, favoritos e janelas destacadas
 continuam disponíveis. A engrenagem e ⌘, abrem Ajustes em popup modal sobre a janela principal;
 Fechar/Esc devolve o foco ao formulário ou workspace. ⌘K abre a busca.
 
+O **botão de lupa no rodapé** abre um slider de zoom com percentual e retorno
+a **100%**, na janela principal e nas destacadas. Arraste para a esquerda para
+diminuir ou para a direita para aumentar. A imagem permanece estável enquanto
+o novo tamanho é preparado e aparece com uma transição breve, respeitando
+Reduzir Movimento do macOS. O controle acompanha os atalhos.
+
 **Visualizar → Aumentar/Diminuir Zoom** muda o tamanho aparente da janela Windows
 inteira, incluindo fontes, menus e botões. ⌘+ (ou ⌘=) aumenta, ⌘− diminui e ⌘0
 restaura o encaixe padrão (100%). Aumentar pede uma janela menor no PC, com
@@ -83,11 +89,13 @@ O primeiro ajuste automático é enviado sem o debounce usado durante resize.
 mac/RemoteDesktop/Scripts/test-customization.sh
 python3 mac/RemoteDesktop/Scripts/test-app-switch.py
 mac/RemoteDesktop/Scripts/test-stream-decoder.sh artifacts/video-media.bin
+python3 mac/RemoteDesktop/Scripts/test-auto-fit.py
 mac/RemoteDesktop/Scripts/test-settings.sh
 mac/RemoteDesktop/Scripts/test-stream-controls.sh
 mac/RemoteDesktop/Scripts/test-window-commands.sh
 mac/RemoteDesktop/Scripts/test-cursor-interaction.sh
 mac/RemoteDesktop/Scripts/test-zoom.sh
+mac/RemoteDesktop/Scripts/test-zoom-slider.sh
 python3 scripts/test-mac-transport.py
 python3 scripts/test-mac-reconnect.py
 ```

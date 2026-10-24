@@ -83,6 +83,7 @@ final class MainWindowController: NSObject, NSWindowDelegate {
     private let emptyTitle = NSTextField(labelWithString: "Selecione um aplicativo na barra")
     private let emptyDesc = NSTextField(wrappingLabelWithString: "Escolha uma janela ou um favorito para começar a trabalhar no Windows.")
     private let videoView = RemoteVideoView()
+    private lazy var zoomControls = ZoomControlsView(videoView: videoView)
     private let floatingBar: NSView
     private let activeAppTitleLabel = NSTextField(labelWithString: "")
     private let streamStatusLabel = NSTextField(labelWithString: "")
@@ -328,7 +329,11 @@ final class MainWindowController: NSObject, NSWindowDelegate {
         thumbnailBar.onShowQuality = { [weak self] source in self?.showStreamControls(from: source) }
         windowActionsView.onAction = { [weak self] action, enabled in self?.sendWindowAction(action, enabled: enabled) }
         videoView.onBoundsChange = { [weak self] in self?.scheduleReadingResize() }
-        videoView.onZoomChange = { [weak self] in self?.sendWindowAction("reading", enabled: true) }
+        videoView.onZoomChange = { [weak self] in
+            guard let self else { return }
+            self.videoView.beginZoomTransition()
+            self.sendWindowAction("reading", enabled: true)
+        }
         windowActionsView.onRequestMenus = { [weak self] in self?.viewConnection?.requestWindowMenus() }
         windowActionsView.onInvokeMenu = { [weak self] id in self?.viewConnection?.invokeWindowMenu(id: id) }
         windowActionsView.onMenuOpen = { [weak self] in
@@ -428,7 +433,7 @@ final class MainWindowController: NSObject, NSWindowDelegate {
         streamControlsPopover.contentViewController = controls
         streamControlsPopover.behavior = .transient
         let barRow = NSStackView(views: [activeAppTitleLabel, streamStatusLabel, reconnectButton,
-                                         windowActionsView, detailsButton])
+                                         windowActionsView, zoomControls, detailsButton])
         barRow.orientation = .horizontal
         barRow.spacing = 10
         barRow.alignment = .centerY
@@ -543,6 +548,7 @@ final class MainWindowController: NSObject, NSWindowDelegate {
         if isSearchOpen { toggleQuickSearch() }
         detailsPopover.close()
         streamControlsPopover.close()
+        zoomControls.close()
         peekHideTask?.cancel()
         videoView.resetInput()
         videoView.restoreCursor()
@@ -595,7 +601,7 @@ final class MainWindowController: NSObject, NSWindowDelegate {
             lastReadingSize = nil
             windowActionsView.update(state: remoteWindowState, windowId: selectedWindow?.id,
                                      isMonitor: false, autoFitEnabled: autoFitEnabled)
-            if autoFitEnabled { scheduleReadingResize(debounce: false) }
+            if autoFitEnabled { scheduleReadingResize(debounce: zoomControls.isShowing) }
             else { connection.sendWindowAction(action, enabled: false) }
             return
         }
@@ -653,7 +659,7 @@ final class MainWindowController: NSObject, NSWindowDelegate {
             emptyDesc.stringValue = "Selecione este cartão ou use Restaurar para retomar o vídeo."
         }
         if paused { window.makeFirstResponder(nil) }
-        else if selectedWindow?.id == state.windowId && !isShowingSettings {
+        else if selectedWindow?.id == state.windowId && !isShowingSettings && !zoomControls.isShowing {
             emptyTitle.stringValue = "Selecione um aplicativo na barra"
             emptyDesc.stringValue = "Escolha uma janela ou um favorito para começar a trabalhar no Windows."
             window.makeFirstResponder(videoView)
@@ -927,6 +933,7 @@ final class MainWindowController: NSObject, NSWindowDelegate {
             AppMotion.setVisible(searchPalette, false) { [weak self] in self?.updateVideoInteractionExclusions() }
             detailsPopover.close()
             streamControlsPopover.close()
+            zoomControls.close()
             videoView.resetInput()
             videoView.restoreCursor()
         } else {
@@ -1508,6 +1515,7 @@ final class MainWindowController: NSObject, NSWindowDelegate {
         cancelStreamRetry()
         detailsPopover.close()
         streamControlsPopover.close()
+        zoomControls.close()
         viewGeneration = UUID()
         audioPlayback.stop()
         videoView.resetInput()
