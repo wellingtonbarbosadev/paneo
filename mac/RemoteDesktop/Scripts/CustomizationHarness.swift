@@ -231,6 +231,25 @@ struct CustomizationHarness {
         check(workspaceRect.contains(stageRect), label(position, density, size, "stage dentro do workspace"))
         check(!barRect.intersects(stageRect), label(position, density, size, "stage separado da barra expandida"))
         check(!videoRect.intersects(footerRect), label(position, density, size, "vídeo separado do rodapé"))
+        guard let dock = value("settingsDock", in: controller) as? NSView else {
+            throw HarnessError.missingView
+        }
+        let dockRect = workspace.convert(dock.bounds, from: dock)
+        check(!dockRect.intersects(barRect), label(position, density, size, "engrenagem separada da barra"))
+        if position.isVertical {
+            guard let actions = value("actionsStack", in: bar) as? NSStackView,
+                  let scroll = value("scrollView", in: bar) as? NSScrollView else {
+                throw HarnessError.missingView
+            }
+            for button in actions.arrangedSubviews {
+                check(button.frame.height >= 32 && button.frame.width <= actions.bounds.width,
+                      label(position, density, size, "controles laterais com área de clique e largura preservadas"))
+            }
+            let actionsRect = bar.convert(actions.bounds, from: actions)
+            let scrollRect = bar.convert(scroll.bounds, from: scroll)
+            check(scrollRect.minY - actionsRect.maxY >= 16,
+                  label(position, density, size, "miniaturas separadas dos controles por 16 pt"))
+        }
 
         if position == .top && density == .compact && size.width == 680 {
             guard let dock = value("settingsDock", in: controller) as? NSView,
@@ -252,7 +271,7 @@ struct CustomizationHarness {
                   "fechar busca remove exclusões de entrada da paleta")
         }
 
-        if position == .left && size.width == 680 {
+        if position.isVertical && size.width == 680 {
             try verifySidebarContent(bar, defaults: defaults, workspace: workspace, density: density)
         }
 
@@ -381,7 +400,8 @@ struct CustomizationHarness {
         let scrollRect = scroll.convert(scroll.bounds, to: bar)
         check(barRect.contains(actionsRect) && barRect.contains(scrollRect) && !actionsRect.intersects(scrollRect),
               "ações e rolagem cabem na barra lateral")
-        check(scroll.hasVerticalScroller, "barra lateral usa rolagem vertical")
+        check(scroll.hasVerticalScroller && scroll.contentView.bounds.height >= cardSize.height,
+              "barra lateral mantém área de rolagem para pelo menos um card")
         let documentHeight = stack.bounds.height
         let contentHeight = stack.arrangedSubviews.reduce(CGFloat.zero) { $0 + $1.frame.height }
             + CGFloat(max(0, stack.arrangedSubviews.count - 1)) * stack.spacing

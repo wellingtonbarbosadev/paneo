@@ -763,11 +763,12 @@ final class MainWindowController: NSObject, NSWindowDelegate {
         let position = settings.barPosition
         peekStrip.position = position
         var constraints: [NSLayoutConstraint] = []
+        // Reserva o canto da engrenagem nas barras direita e inferior.
         if position.isVertical {
             constraints += [
                 thumbnailBar.widthAnchor.constraint(equalToConstant: thickness),
                 thumbnailBar.topAnchor.constraint(equalTo: workspaceView.topAnchor, constant: 10),
-                thumbnailBar.bottomAnchor.constraint(equalTo: workspaceView.bottomAnchor, constant: -10),
+                thumbnailBar.bottomAnchor.constraint(equalTo: workspaceView.bottomAnchor, constant: position == .right ? -60 : -10),
                 mainStage.topAnchor.constraint(equalTo: workspaceView.topAnchor),
                 mainStage.bottomAnchor.constraint(equalTo: workspaceView.bottomAnchor),
                 peekStrip.topAnchor.constraint(equalTo: workspaceView.topAnchor),
@@ -778,7 +779,7 @@ final class MainWindowController: NSObject, NSWindowDelegate {
             constraints += [
                 thumbnailBar.heightAnchor.constraint(equalToConstant: thickness),
                 thumbnailBar.leadingAnchor.constraint(equalTo: workspaceView.leadingAnchor, constant: 14),
-                thumbnailBar.trailingAnchor.constraint(equalTo: workspaceView.trailingAnchor, constant: -14),
+                thumbnailBar.trailingAnchor.constraint(equalTo: workspaceView.trailingAnchor, constant: position == .bottom ? -64 : -14),
                 mainStage.leadingAnchor.constraint(equalTo: workspaceView.leadingAnchor),
                 mainStage.trailingAnchor.constraint(equalTo: workspaceView.trailingAnchor),
                 peekStrip.leadingAnchor.constraint(equalTo: workspaceView.leadingAnchor),

@@ -538,7 +538,7 @@ final class WindowThumbnailBar: NSView {
         let vertical = position.isVertical
         cardsStack.orientation = vertical ? .vertical : .horizontal
         cardsStack.alignment = vertical ? .centerX : .centerY
-        cardsStack.spacing = density == .large ? 10 : 7
+        cardsStack.spacing = vertical || density == .large ? 10 : 7
         badgeStack.orientation = vertical ? .horizontal : .vertical
         badgeStack.alignment = vertical ? .centerY : .leading
         actionsStack.orientation = vertical ? .vertical : .horizontal
@@ -570,18 +570,21 @@ final class WindowThumbnailBar: NSView {
             content = [
                 badgeStack.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 12),
                 badgeStack.trailingAnchor.constraint(lessThanOrEqualTo: panel.trailingAnchor, constant: -12),
-                badgeStack.topAnchor.constraint(equalTo: panel.topAnchor, constant: 12),
+                badgeStack.topAnchor.constraint(equalTo: panel.topAnchor, constant: 14),
                 scrollView.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 6),
                 scrollView.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -6),
                 scrollView.topAnchor.constraint(equalTo: badgeStack.bottomAnchor, constant: 8),
-                scrollView.bottomAnchor.constraint(equalTo: actionsStack.topAnchor, constant: -8),
+                scrollView.bottomAnchor.constraint(equalTo: actionsStack.topAnchor, constant: -16),
                 cardsStack.topAnchor.constraint(equalTo: scrollView.topAnchor, constant: 2),
                 cardsStack.centerXAnchor.constraint(equalTo: scrollView.centerXAnchor),
                 cardsStack.widthAnchor.constraint(equalTo: scrollView.widthAnchor, constant: -8),
-                actionsStack.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 10),
-                actionsStack.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -10),
-                actionsStack.bottomAnchor.constraint(equalTo: panel.bottomAnchor, constant: -10)
-            ]
+                actionsStack.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 12),
+                actionsStack.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -12),
+                actionsStack.bottomAnchor.constraint(equalTo: panel.bottomAnchor, constant: -14)
+            ] + actionsStack.arrangedSubviews.flatMap { button in
+                [button.heightAnchor.constraint(equalToConstant: 32),
+                 button.widthAnchor.constraint(equalTo: actionsStack.widthAnchor)]
+            }
         } else {
             content = [
                 badgeStack.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 14),
