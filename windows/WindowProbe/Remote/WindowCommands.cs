@@ -31,7 +31,7 @@ internal sealed class UnavailableWindowCommands(long windowId) : IWindowCommands
 /// <summary>Controles Win32 limitados ao HWND e PID selecionados na sessão.</summary>
 internal sealed class WindowCommands : IWindowCommands
 {
-    private const int GwlStyle = -16, GwlExStyle = -20;
+    private const int GwlStyle = -16;
     private const long WsThickFrame = 0x00040000;
     private const uint SwMinimize = 6, SwMaximize = 3, SwRestore = 9;
     private const uint WmClose = 0x0010, WmCommand = 0x0111;
@@ -40,6 +40,7 @@ internal sealed class WindowCommands : IWindowCommands
     private const uint MfsDisabled = 0x0003, MfsChecked = 0x0008, MftSeparator = 0x0800, MftOwnerDraw = 0x0100, MiimState = 0x0001, MiimId = 0x0002, MiimSubMenu = 0x0004, MiimFType = 0x0100, MiimString = 0x0040;
     private const uint MnsNotifyByPos = 0x08000000, MimStyle = 0x00000010;
     private const uint MonitorDefaultToNearest = 2;
+    private const int DwmwaExtendedFrameBounds = 9;
     private const uint SwpNoZOrder = 0x0004, SwpNoActivate = 0x0010, SwpAsyncWindowPos = 0x4000;
     private const uint WpfAsyncWindowPlacement = 0x0004;
     private const int MaxMenuItems = 128, MaxMenuDepth = 4;
@@ -120,7 +121,7 @@ internal sealed class WindowCommands : IWindowCommands
                                 if (acquiredHere) _ = RestoreOriginalPlacement();
                                 return Result(action, false, "Windows não restaurou a janela para redimensionar.");
                             }
-                            if (!ResizeClientArea(w, h))
+                            if (!ResizeVisibleFrame(w, h))
                             {
                                 if (acquiredHere) _ = RestoreOriginalPlacement();
                                 return Result(action, false, "Windows recusou o tamanho solicitado.");
@@ -303,29 +304,62 @@ internal sealed class WindowCommands : IWindowCommands
         return false;
     }
 
-    private bool ResizeClientArea(int width, int height)
+    private bool ResizeVisibleFrame(int width, int height)
     {
         if (!originalPlacement.HasValue || !CanResizeCore() || IsIconic(hwnd) || width <= 0 || height <= 0) return false;
         uint dpi = GetDpiForWindow(hwnd);
-        if (dpi == 0) return false;
-        width = (int)Math.Clamp(Math.Round(width * (dpi / 96d)), 1d, 32768d);
-        height = (int)Math.Clamp(Math.Round(height * (dpi / 96d)), 1d, 32768d);
-        uint style = unchecked((uint)GetWindowLongPtr(hwnd, GwlStyle).ToInt64());
-        uint exStyle = unchecked((uint)GetWindowLongPtr(hwnd, GwlExStyle).ToInt64());
-        var frame = new RECT { Right = width, Bottom = height };
-        if (!AdjustWindowRectExForDpi(ref frame, style, GetMenu(hwnd) != IntPtr.Zero, exStyle, dpi)) return false;
-        int outerWidth = frame.Right - frame.Left, outerHeight = frame.Bottom - frame.Top;
+        if (dpi == 0 || !GetWindowRect(hwnd, out RECT outer)
+            || DwmGetWindowAttribute(hwnd, DwmwaExtendedFrameBounds, out RECT visible, Marshal.SizeOf<RECT>()) < 0) return false;
         IntPtr monitor = MonitorFromWindow(hwnd, MonitorDefaultToNearest);
         var monitorInfo = new MONITORINFO { Size = Marshal.SizeOf<MONITORINFO>() };
         if (!GetMonitorInfo(monitor, ref monitorInfo)) return false;
-        int maxOuterWidth = monitorInfo.Work.Right - monitorInfo.Work.Left;
-        int maxOuterHeight = monitorInfo.Work.Bottom - monitorInfo.Work.Top;
-        outerWidth = Math.Min(outerWidth, maxOuterWidth);
-        outerHeight = Math.Min(outerHeight, maxOuterHeight);
-        if (!GetWindowRect(hwnd, out RECT current)) return false;
-        int x = Math.Clamp(current.Left, monitorInfo.Work.Left, monitorInfo.Work.Right - outerWidth);
-        int y = Math.Clamp(current.Top, monitorInfo.Work.Top, monitorInfo.Work.Bottom - outerHeight);
-        return SetWindowPos(hwnd, IntPtr.Zero, x, y, outerWidth, outerHeight, SwpNoZOrder | SwpNoActivate | SwpAsyncWindowPos);
+        if (!TryCalculateReadingBounds(width, height, dpi,
+                new Bounds(outer.Left, outer.Top, outer.Right, outer.Bottom),
+                new Bounds(visible.Left, visible.Top, visible.Right, visible.Bottom),
+                new Bounds(monitorInfo.Work.Left, monitorInfo.Work.Top, monitorInfo.Work.Right, monitorInfo.Work.Bottom),
+                out Bounds target)) return false;
+        return SetWindowPos(hwnd, IntPtr.Zero, target.Left, target.Top, target.Width, target.Height,
+            SwpNoZOrder | SwpNoActivate | SwpAsyncWindowPos);
+    }
+
+    internal readonly record struct Bounds(int Left, int Top, int Right, int Bottom)
+    {
+        internal int Width => Right - Left;
+        internal int Height => Bottom - Top;
+    }
+
+    internal static bool TryCalculateReadingBounds(
+        int width, int height, uint dpi, Bounds outer, Bounds visible, Bounds work, out Bounds target)
+    {
+        // Reading sizes the visible frame; GetWindowRect also includes invisible resize insets.
+        target = default;
+        long outerWidth = (long)outer.Right - outer.Left, outerHeight = (long)outer.Bottom - outer.Top;
+        long visibleWidth = (long)visible.Right - visible.Left, visibleHeight = (long)visible.Bottom - visible.Top;
+        long workWidth = (long)work.Right - work.Left, workHeight = (long)work.Bottom - work.Top;
+        long insetLeft = (long)visible.Left - outer.Left, insetTop = (long)visible.Top - outer.Top;
+        long insetRight = (long)outer.Right - visible.Right, insetBottom = (long)outer.Bottom - visible.Bottom;
+        if (width <= 0 || height <= 0 || dpi == 0 || outerWidth <= 0 || outerHeight <= 0
+            || visibleWidth <= 0 || visibleHeight <= 0 || workWidth <= 0 || workHeight <= 0
+            || insetLeft < 0 || insetTop < 0 || insetRight < 0 || insetBottom < 0)
+            return false;
+
+        double preferredWidth = width * (dpi / 96d), preferredHeight = height * (dpi / 96d);
+        long maxVisibleWidth = workWidth - insetLeft - insetRight;
+        long maxVisibleHeight = workHeight - insetTop - insetBottom;
+        if (maxVisibleWidth < 1 || maxVisibleHeight < 1) return false;
+        double scale = Math.Min(1d, Math.Min(32768d / Math.Max(preferredWidth, preferredHeight),
+            Math.Min((double)maxVisibleWidth / preferredWidth, (double)maxVisibleHeight / preferredHeight)));
+        int targetVisibleWidth = Math.Max(1, (int)Math.Floor(preferredWidth * scale + 1e-7));
+        int targetVisibleHeight = Math.Max(1, (int)Math.Floor(preferredHeight * scale + 1e-7));
+        long targetWidthLong = targetVisibleWidth + insetLeft + insetRight;
+        long targetHeightLong = targetVisibleHeight + insetTop + insetBottom;
+        if (targetWidthLong > int.MaxValue || targetHeightLong > int.MaxValue) return false;
+        int targetWidth = (int)targetWidthLong;
+        int targetHeight = (int)targetHeightLong;
+        long x = Math.Clamp((long)visible.Left - insetLeft, (long)work.Left, (long)work.Right - targetWidth);
+        long y = Math.Clamp((long)visible.Top - insetTop, (long)work.Top, (long)work.Bottom - targetHeight);
+        target = new Bounds((int)x, (int)y, (int)(x + targetWidth), (int)(y + targetHeight));
+        return true;
     }
 
     private bool RestoreOriginalPlacement()
@@ -405,10 +439,10 @@ internal sealed class WindowCommands : IWindowCommands
     [DllImport("user32.dll", SetLastError = true)] private static extern bool SetWindowPlacement(IntPtr hwnd, ref WINDOWPLACEMENT placement);
     [DllImport("user32.dll", SetLastError = true)] private static extern bool GetWindowRect(IntPtr hwnd, out RECT rect);
     [DllImport("user32.dll", SetLastError = true)] private static extern bool SetWindowPos(IntPtr hwnd, IntPtr after, int x, int y, int width, int height, uint flags);
+    [DllImport("dwmapi.dll")] private static extern int DwmGetWindowAttribute(IntPtr hwnd, int attribute, out RECT value, int size);
     [DllImport("user32.dll")] private static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint flags);
     [DllImport("user32.dll", EntryPoint = "GetMonitorInfoW", CharSet = CharSet.Unicode)] private static extern bool GetMonitorInfo(IntPtr monitor, ref MONITORINFO info);
     [DllImport("user32.dll")] private static extern uint GetDpiForWindow(IntPtr hwnd);
-    [DllImport("user32.dll", SetLastError = true)] private static extern bool AdjustWindowRectExForDpi(ref RECT rect, uint style, bool menu, uint exStyle, uint dpi);
     [DllImport("user32.dll")] private static extern IntPtr GetMenu(IntPtr hwnd);
     [DllImport("user32.dll")] private static extern IntPtr GetSubMenu(IntPtr menu, int position);
     [DllImport("user32.dll")] private static extern int GetMenuItemCount(IntPtr menu);

@@ -17,6 +17,45 @@ static void Check(bool condition, string message)
     if (!condition) throw new Exception(message);
 }
 
+var outerFrame = new WindowCommands.Bounds(100, 80, 1016, 618);
+var visibleFrame = new WindowCommands.Bounds(108, 110, 1008, 610);
+var roomyWorkArea = new WindowCommands.Bounds(0, 0, 2000, 1200);
+Check(WindowCommands.TryCalculateReadingBounds(960, 540, 96, outerFrame, visibleFrame, roomyWorkArea, out var fitted)
+    && fitted == new WindowCommands.Bounds(100, 80, 1076, 658), "Reading não ajustou o quadro 16:9 à área de vídeo.");
+Check(WindowCommands.TryCalculateReadingBounds(640, 360, 144, outerFrame, visibleFrame,
+        new WindowCommands.Bounds(0, 0, 1024, 768), out fitted)
+    && fitted.Width == 976 && fitted.Height == 578, "Reading não converteu pontos por DPI mantendo proporção.");
+Check(WindowCommands.TryCalculateReadingBounds(1920, 1080, 96, outerFrame, visibleFrame,
+        new WindowCommands.Bounds(0, 0, 1000, 700), out fitted)
+    && fitted.Width == 1000 && fitted.Height <= 700
+    && Math.Abs((double)(fitted.Width - 16) / (fitted.Height - 38) - 16d / 9) < .003,
+    $"Limite do work area alterou a proporção do quadro: {fitted.Width}×{fitted.Height}.");
+Check(WindowCommands.TryCalculateReadingBounds(600, 1200, 96, outerFrame, visibleFrame,
+        new WindowCommands.Bounds(0, 0, 500, 900), out fitted)
+    && fitted.Width <= 500 && fitted.Height <= 900
+    && Math.Abs((double)(fitted.Width - 16) / (fitted.Height - 38) - .5) < .003,
+    "Limite do work area alterou a proporção de um quadro retrato.");
+Check(WindowCommands.TryCalculateReadingBounds(15000, 5000, 384, outerFrame, visibleFrame,
+        new WindowCommands.Bounds(0, 0, 10000, 7000), out fitted)
+    && fitted.Width <= 10000 && fitted.Height <= 7000
+    && Math.Abs((double)(fitted.Width - 16) / (fitted.Height - 38) - 3) < .001,
+    "Pedido panorâmico em DPI alto não manteve proporção sob limite do monitor.");
+Check(WindowCommands.TryCalculateReadingBounds(15000, 5000, 384, outerFrame, visibleFrame,
+        new WindowCommands.Bounds(0, 0, 40000, 25000), out fitted)
+    && fitted.Width - 16 <= 32768
+    && Math.Abs((double)(fitted.Width - 16) / (fitted.Height - 38) - 3) < .001,
+    "Teto de dimensão alterou a proporção do pedido em DPI alto.");
+Check(WindowCommands.TryCalculateReadingBounds(1, 1, 96, outerFrame, visibleFrame, roomyWorkArea, out fitted)
+    && fitted.Width == 17 && fitted.Height == 39, "Dimensões mínimas válidas não foram preservadas.");
+Check(!WindowCommands.TryCalculateReadingBounds(0, 1, 96, outerFrame, visibleFrame, roomyWorkArea, out _)
+    && !WindowCommands.TryCalculateReadingBounds(1, 1, 0, outerFrame, visibleFrame, roomyWorkArea, out _)
+    && !WindowCommands.TryCalculateReadingBounds(100, 100, 96, outerFrame, visibleFrame,
+        new WindowCommands.Bounds(0, 0, 16, 38), out _)
+    && !WindowCommands.TryCalculateReadingBounds(100, 100, 96, outerFrame,
+        new WindowCommands.Bounds(90, 110, 1008, 610), roomyWorkArea, out _),
+    "Geometria inválida ou impossível foi aceita.");
+Console.WriteLine("PASS geometria de reading preserva proporção, DPI, insets e limites do monitor");
+
 // A cadência mantém 30/60 FPS com jitter e não libera rajadas após pausas.
 foreach (int targetFps in new[] { 30, 60 })
 foreach (int intervalMs in (targetFps == 30 ? new[] { 16, 17, 32, 33 } : new[] { 8, 9, 15, 16 }))

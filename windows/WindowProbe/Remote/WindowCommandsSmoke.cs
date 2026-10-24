@@ -7,6 +7,7 @@ using System.Windows.Controls;
 using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Threading;
+using WindowProbe.Capture;
 
 namespace WindowProbe.Remote;
 
@@ -23,6 +24,7 @@ internal static class WindowCommandsSmoke
     [DllImport("user32.dll")] private static extern bool DestroyMenu(IntPtr menu);
     [DllImport("user32.dll")] private static extern uint EnableMenuItem(IntPtr menu, UIntPtr item, uint flags);
     [DllImport("user32.dll")] private static extern bool GetWindowRect(IntPtr hwnd, out RECT rect);
+    [DllImport("dwmapi.dll")] private static extern int DwmGetWindowAttribute(IntPtr hwnd, uint attribute, out RECT rect, int size);
 
     [StructLayout(LayoutKind.Sequential)] private struct RECT { public int Left, Top, Right, Bottom; }
 
@@ -89,6 +91,8 @@ internal static class WindowCommandsSmoke
                 return IntPtr.Zero;
             });
 
+            await VerifyAutoFitAsync(window, hwnd, root);
+
             string pin = RandomNumberGenerator.GetInt32(10_000_000, 100_000_000).ToString(System.Globalization.CultureInfo.InvariantCulture);
             var credentials = HostCredentials.Create(pin);
             // A enumeração roda na thread do servidor. Capture os valores WPF
@@ -145,6 +149,47 @@ internal static class WindowCommandsSmoke
             allowFinalClose = true;
             window.Close();
         }
+    }
+
+    private static async Task VerifyAutoFitAsync(Window window, IntPtr hwnd, string root)
+    {
+        var evidence = new List<object>();
+        double minWidth = window.MinWidth, minHeight = window.MinHeight;
+        window.MinWidth = window.MinHeight = 100;
+        try
+        {
+            if (!GetWindowRect(hwnd, out RECT original)) throw new InvalidOperationException("Geometria inicial indisponível.");
+            using var commands = new WindowCommands(hwnd);
+            foreach (var (width, height) in new[] { (1120, 630), (640, 900), (4096, 2304) })
+            {
+                var result = commands.Execute(JsonSerializer.SerializeToElement(new { action = "reading", enabled = true, width, height }));
+                if (!result.Success) throw new InvalidOperationException(result.Message);
+                await Task.Delay(500);
+                string image = Path.Combine(root, $"auto-fit-{width}x{height}.png");
+                using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(12));
+                CaptureResult frame = await new WindowCaptureService().CaptureAsync(hwnd, image, TimeSpan.FromSeconds(8), null, timeout.Token);
+                _ = GetWindowRect(hwnd, out RECT outer);
+                bool hasVisible = DwmGetWindowAttribute(hwnd, 9, out RECT visible, Marshal.SizeOf<RECT>()) == 0;
+                bool matchesAspect = Math.Abs(frame.Width - (double)width * frame.Height / height) <= 2;
+                evidence.Add(new
+                {
+                    requested = new[] { width, height }, captured = new[] { frame.Width, frame.Height },
+                    outer = new[] { outer.Right - outer.Left, outer.Bottom - outer.Top },
+                    visible = hasVisible ? new[] { visible.Right - visible.Left, visible.Bottom - visible.Top } : null,
+                    matchesAspect
+                });
+                await File.WriteAllTextAsync(Path.Combine(root, "auto-fit-measurements.json"),
+                    JsonSerializer.Serialize(evidence, new JsonSerializerOptions { WriteIndented = true }));
+                if (!matchesAspect) throw new InvalidOperationException("A captura não preservou a proporção da área de vídeo.");
+                result = commands.Execute(JsonSerializer.SerializeToElement(new { action = "reading", enabled = false }));
+                if (!result.Success) throw new InvalidOperationException(result.Message);
+                await Task.Delay(350);
+                if (!GetWindowRect(hwnd, out RECT restored) || restored.Left != original.Left || restored.Top != original.Top
+                    || restored.Right != original.Right || restored.Bottom != original.Bottom)
+                    throw new InvalidOperationException("O ajuste automático não restaurou a geometria original.");
+            }
+        }
+        finally { window.MinWidth = minWidth; window.MinHeight = minHeight; }
     }
 
     private static IntPtr BuildMenu()
