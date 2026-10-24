@@ -187,7 +187,9 @@ public static class ContinuousWindowCapture
             using var pool = Direct3D11CaptureFramePool.CreateFreeThreaded(
                 device.WinRtDevice, PixelFormat, options.BufferCount, size);
             using var session = pool.CreateCaptureSession(item);
-            session.IsCursorCaptureEnabled = options.CaptureCursor;
+            // WGC duplica o cursor nas janelas encobertas; compomos apenas no alvo real.
+            session.IsCursorCaptureEnabled = false;
+            using var cursor = options.CaptureCursor ? new CursorOverlay() : null;
 
             using var closedCts = new CancellationTokenSource();
             int closedFlag = 0;
@@ -271,7 +273,8 @@ public static class ContinuousWindowCapture
                     using Direct3D11CaptureFrame? frame = TakeNewestFrame(pool, ref coalesced);
                     if (frame is null)
                     {
-                        if (options.RawPixels && options.RawFrame is not null && hasPixels && pixels is not null)
+                        if (hasPixels && pixels is not null
+                            && (options.RawPixels && options.RawFrame is not null || cursor is not null))
                         {
                             TimeSpan repeatAt = watch.Elapsed;
                             long repeatStart = options.Timings is null ? 0 : Stopwatch.GetTimestamp();
@@ -282,7 +285,18 @@ public static class ContinuousWindowCapture
                                 lastHeight,
                                 lastStride,
                                 repeatAt);
-                            await options.RawFrame(rawRepeat, token).ConfigureAwait(false);
+                            if (options.RawPixels && options.RawFrame is not null)
+                            {
+                                await options.RawFrame(rawRepeat with
+                                {
+                                    Bgra = cursor?.Compose(pixels, lastWidth, lastHeight, lastStride, hwnd, options.MonitorHandle) ?? pixels
+                                }, token).ConfigureAwait(false);
+                            }
+                            else
+                            {
+                                await onFrame(await EncodePngWithCursorAsync(rawRepeat, cursor!, hwnd, options.MonitorHandle, token).ConfigureAwait(false), token).ConfigureAwait(false);
+                                await frameSignal.WaitAsync(PollInterval, token).ConfigureAwait(false);
+                            }
                             if (options.Timings is not null)
                             {
                                 options.Timings(TimeSpan.Zero, Stopwatch.GetElapsedTime(repeatStart));
@@ -361,7 +375,7 @@ public static class ContinuousWindowCapture
 
                         var raw = new RawPixelFrame(
                             sequence + 1,
-                            pixels,
+                            cursor?.Compose(pixels, rawWidth, rawHeight, rawStride, hwnd, options.MonitorHandle) ?? pixels,
                             rawWidth,
                             rawHeight,
                             rawStride,
@@ -381,17 +395,26 @@ public static class ContinuousWindowCapture
                         .CreateCopyFromSurfaceAsync(frame.Surface).AsTask(token).ConfigureAwait(false);
                     token.ThrowIfCancellationRequested();
 
-                    var encodeWatch = Stopwatch.StartNew();
-                    byte[] png = await PngWriter.EncodeAsync(bitmap, token).ConfigureAwait(false);
-                    TimeSpan encodeDuration = encodeWatch.Elapsed;
-
-                    var captured = new CapturedFrame(
-                        sequence + 1,
-                        png,
-                        bitmap.PixelWidth,
-                        bitmap.PixelHeight,
-                        watch.Elapsed,
-                        encodeDuration);
+                    CapturedFrame captured;
+                    if (cursor is not null)
+                    {
+                        lastWidth = bitmap.PixelWidth;
+                        lastHeight = bitmap.PixelHeight;
+                        lastStride = lastWidth * 4;
+                        int needed = checked(lastStride * lastHeight);
+                        if (pixels is null || pixels.Length != needed) pixels = new byte[needed];
+                        bitmap.CopyToBuffer(pixels.AsBuffer());
+                        hasPixels = true;
+                        captured = await EncodePngWithCursorAsync(new RawPixelFrame(sequence + 1, pixels,
+                            lastWidth, lastHeight, lastStride, capturedAt), cursor, hwnd, options.MonitorHandle, token).ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        var encodeWatch = Stopwatch.StartNew();
+                        byte[] png = await PngWriter.EncodeAsync(bitmap, token).ConfigureAwait(false);
+                        captured = new CapturedFrame(sequence + 1, png, bitmap.PixelWidth,
+                            bitmap.PixelHeight, watch.Elapsed, encodeWatch.Elapsed);
+                    }
 
                     // PNG já possui os bytes; libera GPU/bitmap antes de esperar a rede.
                     bitmap.Dispose();
@@ -429,6 +452,17 @@ public static class ContinuousWindowCapture
             // GraphicsCaptureItem não expõe IClosable; o wrapper é liberado aqui.
             WinRtInterop.CloseQuietly(item);
         }
+    }
+
+    private static async Task<CapturedFrame> EncodePngWithCursorAsync(
+        RawPixelFrame frame, CursorOverlay cursor, IntPtr hwnd, IntPtr monitor, CancellationToken token)
+    {
+        var watch = Stopwatch.StartNew();
+        byte[] composed = cursor.Compose(frame.Bgra, frame.Width, frame.Height, frame.Stride, hwnd, monitor);
+        using var bitmap = SoftwareBitmap.CreateCopyFromBuffer(composed.AsBuffer(), BitmapPixelFormat.Bgra8,
+            frame.Width, frame.Height, BitmapAlphaMode.Premultiplied);
+        byte[] png = await PngWriter.EncodeAsync(bitmap, token).ConfigureAwait(false);
+        return new CapturedFrame(frame.Sequence, png, frame.Width, frame.Height, frame.Elapsed, watch.Elapsed);
     }
 
     /// <summary>
