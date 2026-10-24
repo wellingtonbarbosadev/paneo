@@ -44,10 +44,16 @@ maximizar/restaurar e solicitar o fechamento normal. Os botões nativos do Mac
 continuam controlando apenas o visualizador. Uma janela minimizada mantém seu
 card; selecione-o ou use Restaurar para retomar o vídeo.
 
-**Modo leitura** ajusta a janela Windows à área disponível no Mac, levando o DPI
-em conta e respeitando a área útil do monitor. Ao desligar o modo, trocar de
-janela ou desconectar, o host restaura a posição, o tamanho e o estado anteriores.
-Esse modo não é reaplicado após reconexão.
+O **ajuste automático** acompanha a área de vídeo ao selecionar uma janela,
+redimensionar o Paneo, mudar a barra ou entrar em tela cheia. O host ajusta o
+quadro visível da janela Windows preservando a proporção e respeitando a área
+útil do monitor. **Ajustes → Ajustar janelas automaticamente** salva a preferência
+neste Mac e aplica a mudança às janelas abertas; o padrão é ligado.
+**Janela → Ajustar automaticamente** liga/desliga o ajuste somente para a janela
+atual; a marca indica quando está ligado. Desligar, trocar de janela ou desconectar restaura
+posição, tamanho e estado anteriores. Uma reconexão reaplica o ajuste se ele
+continuar ligado. Janelas fixas, monitores e hosts antigos mantêm a proporção
+original; limites de tamanho impostos pelo aplicativo podem deixar margens.
 
 Em **Janela → Menus do aplicativo**, menus Win32 padrão aparecem com submenus,
 itens marcados e desabilitados. Aplicativos com menus customizados podem não

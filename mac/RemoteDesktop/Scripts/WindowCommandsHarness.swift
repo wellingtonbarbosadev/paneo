@@ -53,6 +53,19 @@ struct WindowCommandsHarness {
                        windowId: 42, isMonitor: false)
         let actionsMenu = actions.makeActionsMenu()!
         check(actionsMenu.items[1].title == "Restaurar", "minimized window offers Restore")
+        let autoFit = actionsMenu.items.first { $0.representedObject as? String == "reading" }!
+        check(autoFit.title == "Ajustar automaticamente" && autoFit.state == .off,
+              "auto-fit menu offers an unchecked toggle when disabled")
+        actions.update(state: RemoteWindowState(windowId: 42, minimized: false, maximized: false,
+                                                reading: true, canResize: true),
+                       windowId: 42, isMonitor: false, autoFitEnabled: true)
+        let enabledAutoFit = actions.makeActionsMenu()!.items.first { $0.representedObject as? String == "reading" }!
+        check(enabledAutoFit.title == autoFit.title && enabledAutoFit.state == .on,
+              "auto-fit menu keeps its title and checks the enabled toggle")
+        var toggled = false
+        actions.onAction = { action, enabled in toggled = action == "reading" && enabled == nil }
+        NSApp.sendAction(enabledAutoFit.action!, to: enabledAutoFit.target, from: enabledAutoFit)
+        check(toggled, "auto-fit menu click requests the per-window toggle")
         actions.update(state: RemoteWindowState(windowId: 7, minimized: false, maximized: false,
                                                 reading: false, canResize: true),
                        windowId: 42, isMonitor: false)

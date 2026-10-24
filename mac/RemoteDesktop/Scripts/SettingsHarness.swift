@@ -26,12 +26,19 @@ struct SettingsHarness {
 
         check(settings.barPosition == .top && settings.barDensity == .compact && settings.appearance == .system,
               "initial settings use existing defaults")
+        let autoFitButton = value("autoFitWindowsButton", in: controller) as? NSButton
+        check(settings.autoFitWindows && autoFitButton?.state == .on,
+              "automatic window fitting defaults to enabled")
+        check(autoFitButton?.accessibilityLabel() == "Ajustar janelas automaticamente" &&
+              autoFitButton?.accessibilityHelp()?.contains("espaço disponível para vídeo") == true,
+              "automatic window fitting explains its behavior accessibly")
         check(document.isFlipped, "scroll document uses top-down coordinates")
 
         click("position", value: BarPosition.right.rawValue, buttons: buttons)
         click("density", value: BarDensity.icons.rawValue, buttons: buttons)
         click("appearance", value: AppAppearance.dark.rawValue, buttons: buttons)
         click("accent", value: AppAccent.custom.rawValue, buttons: buttons)
+        autoFitButton?.performClick(nil)
         let accent = NSColor(srgbRed: 0.18, green: 0.42, blue: 0.76, alpha: 1)
         let colorWell = value("accentWell", in: controller) as? NSColorWell
         colorWell?.color = accent
@@ -42,6 +49,8 @@ struct SettingsHarness {
         check(settings.barPosition == .right && settings.barDensity == .icons &&
               settings.appearance == .dark && settings.accent == .custom,
               "choice controls update the injected preferences")
+        check(!settings.autoFitWindows && autoFitButton?.state == .off,
+              "automatic window fitting checkbox updates its preference")
         check(settings.accentColor.redComponent > 0.17 && settings.accentColor.redComponent < 0.19,
               "custom accent saves through NSColorWell action")
         for (key, expected) in [("position", "right"), ("density", "icons"),
@@ -60,6 +69,10 @@ struct SettingsHarness {
         check(storedSettings.barPosition == .right && storedSettings.barDensity == .icons &&
               storedSettings.appearance == .dark && storedSettings.accent == .custom,
               "settings survive a new AppSettings instance in isolated defaults")
+        check(!storedSettings.autoFitWindows, "automatic window fitting survives a new AppSettings instance")
+        autoFitButton?.performClick(nil)
+        check(settings.autoFitWindows && autoFitButton?.state == .on,
+              "automatic window fitting can be enabled immediately")
 
         let sizes = [NSSize(width: 920, height: 650), NSSize(width: 760, height: 600), NSSize(width: 632, height: 390),
                      NSSize(width: 1040, height: 680), NSSize(width: 680, height: 480)]
@@ -96,7 +109,7 @@ struct SettingsHarness {
               close.frame.maxY <= controller.view.bounds.maxY - 20,
               "Fechar mantém margem confortável e fica fora da rolagem")
         window.close()
-        print("PASS: escolhas, prefs isoladas, preview 4×3, opções visíveis e AppMotion em 632×390, 680×480, 760×600, 920×650 e 1040×680; Fechar")
+        print("PASS: escolhas, prefs isoladas, ajuste automático, preview 4×3, opções visíveis e AppMotion em 632×390, 680×480, 760×600, 920×650 e 1040×680; Fechar")
     }
 
     private static func click(_ key: String, value: String, buttons: [String: [NSButton]]) {

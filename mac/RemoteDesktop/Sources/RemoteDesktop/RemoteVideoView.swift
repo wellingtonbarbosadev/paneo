@@ -8,6 +8,7 @@ final class RemoteVideoView: NSView, @preconcurrency NSTextInputClient {
     /// Eventos de entrada enviada ao host.
     var send: ((RemoteInputEvent) -> Void)?
     var onDropFiles: (([URL]) -> Void)?
+    var onBoundsChange: (() -> Void)?
 
     let decoder = H264Decoder()
     /// Fallback quando o Windows não tem encoder H.264.
@@ -35,6 +36,16 @@ final class RemoteVideoView: NSView, @preconcurrency NSTextInputClient {
     override var acceptsFirstResponder: Bool { true }
     override var isFlipped: Bool { true }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func setFrameSize(_ newSize: NSSize) {
+        let changed = frame.size != newSize
+        super.setFrameSize(newSize)
+        if changed { onBoundsChange?() }
+    }
+    override func setBoundsSize(_ newSize: NSSize) {
+        let changed = bounds.size != newSize
+        super.setBoundsSize(newSize)
+        if changed { onBoundsChange?() }
+    }
     override func resignFirstResponder() -> Bool {
         resetInput()
         return super.resignFirstResponder()

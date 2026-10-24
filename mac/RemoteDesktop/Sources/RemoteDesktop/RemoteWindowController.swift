@@ -30,6 +30,9 @@ final class RemoteWindowController: NSObject, NSWindowDelegate {
     private var restoreOnInitialWindowState = false
     private var readingResizeTask: Task<Void, Never>?
     private var lastReadingSize: (Int, Int)?
+    private let settings: AppSettings
+    private var autoFitEnabled: Bool
+    private var appliedAutoFitPreference: Bool
 
     private let host: String
     private let port: UInt16
@@ -38,7 +41,11 @@ final class RemoteWindowController: NSObject, NSWindowDelegate {
     private let fingerprint: String?
     private let target: RemoteWindow
 
-    init(target: RemoteWindow, host: String, port: UInt16, pin: String?, deviceToken: Data?, fingerprint: String?) {
+    init(target: RemoteWindow, host: String, port: UInt16, pin: String?, deviceToken: Data?, fingerprint: String?,
+         settings: AppSettings = .shared) {
+        self.settings = settings
+        autoFitEnabled = settings.autoFitWindows
+        appliedAutoFitPreference = settings.autoFitWindows
         self.target = target
         restoreOnInitialWindowState = target.minimized
         self.host = host
@@ -52,6 +59,8 @@ final class RemoteWindowController: NSObject, NSWindowDelegate {
                           backing: .buffered,
                           defer: false)
         super.init()
+        NotificationCenter.default.addObserver(self, selector: #selector(settingsDidChange),
+                                               name: AppSettings.didChange, object: settings)
         window.title = target.title.isEmpty ? "Paneo" : "Paneo — \(target.title)"
         window.collectionBehavior.insert(.fullScreenPrimary)
         window.minSize = NSSize(width: 480, height: 320)
@@ -132,7 +141,9 @@ final class RemoteWindowController: NSObject, NSWindowDelegate {
         ])
 
         videoView.send = { [weak self] event in self?.connection?.send(event) }
-        windowActionsView.update(state: nil, windowId: target.id, isMonitor: target.isMonitor)
+        videoView.onBoundsChange = { [weak self] in self?.scheduleReadingResize() }
+        windowActionsView.update(state: nil, windowId: target.id, isMonitor: target.isMonitor,
+                                 autoFitEnabled: autoFitEnabled)
         windowActionsView.onAction = { [weak self] action, enabled in self?.sendWindowAction(action, enabled: enabled) }
         windowActionsView.onRequestMenus = { [weak self] in self?.connection?.requestWindowMenus() }
         windowActionsView.onInvokeMenu = { [weak self] id in self?.connection?.invokeWindowMenu(id: id) }
@@ -179,7 +190,8 @@ final class RemoteWindowController: NSObject, NSWindowDelegate {
                     self.connection = nil
                     self.remoteWindowState = nil
                     self.lastReadingSize = nil
-                    self.windowActionsView.update(state: nil, windowId: self.target.id, isMonitor: self.target.isMonitor)
+                    self.windowActionsView.update(state: nil, windowId: self.target.id, isMonitor: self.target.isMonitor,
+                                                  autoFitEnabled: self.autoFitEnabled)
                     // Recusa de credencial não vira reconexão: repetir dispararia
                     // o bloqueio progressivo do host no PC.
                     if message.hasPrefix(RemoteConnection.authFailurePrefix) {
@@ -236,7 +248,8 @@ final class RemoteWindowController: NSObject, NSWindowDelegate {
             onWindowState: { [weak self] state in
                 guard let self, self.generation == current, state.windowId == self.target.id else { return }
                 self.remoteWindowState = state
-                self.windowActionsView.update(state: state, windowId: self.target.id, isMonitor: self.target.isMonitor)
+                self.windowActionsView.update(state: state, windowId: self.target.id, isMonitor: self.target.isMonitor,
+                                              autoFitEnabled: self.autoFitEnabled)
                 self.videoView.resetInput()
                 self.videoView.isHidden = state.minimized
                 if state.minimized {
@@ -250,10 +263,20 @@ final class RemoteWindowController: NSObject, NSWindowDelegate {
                     self.restoreOnInitialWindowState = false
                     if state.minimized { self.connection?.sendWindowAction("restore") }
                 }
+                if !state.minimized { self.scheduleReadingResize() }
             },
             onWindowCommandResult: { [weak self] action, success, message in
                 guard let self, self.generation == current else { return }
-                if !success { self.statusLabel.stringValue = message ?? "O Windows recusou a ação \(action)." }
+                if !success {
+                    if action == "reading" {
+                        self.autoFitEnabled = false
+                        self.readingResizeTask?.cancel()
+                        self.windowActionsView.update(state: self.remoteWindowState, windowId: self.target.id,
+                                                      isMonitor: self.target.isMonitor,
+                                                      autoFitEnabled: self.autoFitEnabled)
+                    }
+                    self.statusLabel.stringValue = message ?? "O Windows recusou a ação \(action)."
+                }
             },
             onWindowMenus: { [weak self] menus in
                 guard let self, self.generation == current else { return }
@@ -328,7 +351,8 @@ final class RemoteWindowController: NSObject, NSWindowDelegate {
         readingResizeTask?.cancel()
         readingResizeTask = nil
         lastReadingSize = nil
-        windowActionsView.update(state: nil, windowId: target.id, isMonitor: target.isMonitor)
+        windowActionsView.update(state: nil, windowId: target.id, isMonitor: target.isMonitor,
+                                 autoFitEnabled: autoFitEnabled)
         videoView.resetInput()
     }
 
@@ -337,27 +361,52 @@ final class RemoteWindowController: NSObject, NSWindowDelegate {
         detailsPopover.show(relativeTo: detailsButton.bounds, of: detailsButton, preferredEdge: .maxY)
     }
 
-    private func sendWindowAction(_ action: String, enabled: Bool? = nil) {
-        guard let connection, remoteWindowState != nil, !target.isMonitor else { return }
-        if action == "reading", enabled == true {
-            let size = (max(1, Int(videoView.bounds.width.rounded())),
-                        max(1, Int(videoView.bounds.height.rounded())))
-            lastReadingSize = size
-            connection.sendWindowAction(action, enabled: true, width: size.0, height: size.1)
-        } else {
-            connection.sendWindowAction(action, enabled: enabled)
-        }
+    @objc private func settingsDidChange() {
+        guard appliedAutoFitPreference != settings.autoFitWindows else { return }
+        appliedAutoFitPreference = settings.autoFitWindows
+        autoFitEnabled = settings.autoFitWindows
+        sendWindowAction("reading", enabled: autoFitEnabled)
     }
 
-    private func scheduleReadingResize() {
+    private func sendWindowAction(_ action: String, enabled: Bool? = nil) {
+        guard let connection, remoteWindowState != nil, !target.isMonitor else { return }
+        if action == "reading" {
+            autoFitEnabled = enabled ?? !autoFitEnabled
+            readingResizeTask?.cancel()
+            lastReadingSize = nil
+            windowActionsView.update(state: remoteWindowState, windowId: target.id,
+                                     isMonitor: target.isMonitor, autoFitEnabled: autoFitEnabled)
+            if autoFitEnabled { scheduleReadingResize(debounce: false) }
+            else { connection.sendWindowAction(action, enabled: false) }
+            return
+        }
+        if action == "minimize" {
+            readingResizeTask?.cancel()
+        } else if ["maximize", "close"].contains(action) ||
+            (action == "restore" && remoteWindowState?.minimized != true) {
+            let wasAutoFitEnabled = autoFitEnabled
+            autoFitEnabled = false
+            readingResizeTask?.cancel()
+            lastReadingSize = nil
+            if wasAutoFitEnabled { connection.sendWindowAction("reading", enabled: false) }
+        } else if action == "restore" {
+            lastReadingSize = nil
+        }
+        windowActionsView.update(state: remoteWindowState, windowId: target.id,
+                                 isMonitor: target.isMonitor, autoFitEnabled: autoFitEnabled)
+        connection.sendWindowAction(action, enabled: enabled)
+    }
+
+    private func scheduleReadingResize(debounce: Bool = true) {
         readingResizeTask?.cancel()
         readingResizeTask = Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(120))
-            guard !Task.isCancelled, let self, self.remoteWindowState?.reading == true,
+            if debounce { try? await Task.sleep(for: .milliseconds(120)) }
+            guard !Task.isCancelled, let self, self.autoFitEnabled,
+                  !self.target.isMonitor, self.remoteWindowState?.canResize == true,
                   self.remoteWindowState?.minimized != true,
                   let connection = self.connection else { return }
-            let size = (max(1, Int(self.videoView.bounds.width.rounded())),
-                        max(1, Int(self.videoView.bounds.height.rounded())))
+            let size = (Int(self.videoView.bounds.width.rounded()), Int(self.videoView.bounds.height.rounded()))
+            guard size.0 > 0, size.1 > 0 else { return }
             guard self.lastReadingSize?.0 != size.0 || self.lastReadingSize?.1 != size.1 else { return }
             self.lastReadingSize = size
             connection.sendWindowAction("reading", enabled: true, width: size.0, height: size.1)
@@ -378,10 +427,6 @@ final class RemoteWindowController: NSObject, NSWindowDelegate {
 
     func windowDidBecomeKey(_ notification: Notification) {
         videoView.restoreCursor()
-    }
-
-    func windowDidResize(_ notification: Notification) {
-        if remoteWindowState?.reading == true { scheduleReadingResize() }
     }
 
     func windowWillClose(_ notification: Notification) {

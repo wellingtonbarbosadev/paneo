@@ -105,12 +105,16 @@ final class MainWindowController: NSObject, NSWindowDelegate {
     private var restoreOnInitialWindowState = false
     private var readingResizeTask: Task<Void, Never>?
     private var lastReadingSize: (Int, Int)?
+    private var autoFitEnabled: Bool
+    private var appliedAutoFitPreference: Bool
     private let audioPlayback = AudioPlayback()
 
     init(preset: ConnectionPreset? = nil, persistPairing: Bool = true, settings: AppSettings = .shared) {
         self.preset = preset
         self.persistPairing = persistPairing
         self.settings = settings
+        autoFitEnabled = settings.autoFitWindows
+        appliedAutoFitPreference = settings.autoFitWindows
 
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1040, height: 680),
                           styleMask: [.titled, .closable, .miniaturizable, .resizable],
@@ -323,6 +327,7 @@ final class MainWindowController: NSObject, NSWindowDelegate {
         thumbnailBar.onOpenApps = { [weak self] in self?.toggleQuickSearch() }
         thumbnailBar.onShowQuality = { [weak self] source in self?.showStreamControls(from: source) }
         windowActionsView.onAction = { [weak self] action, enabled in self?.sendWindowAction(action, enabled: enabled) }
+        videoView.onBoundsChange = { [weak self] in self?.scheduleReadingResize() }
         windowActionsView.onRequestMenus = { [weak self] in self?.viewConnection?.requestWindowMenus() }
         windowActionsView.onInvokeMenu = { [weak self] id in self?.viewConnection?.invokeWindowMenu(id: id) }
         windowActionsView.onMenuOpen = { [weak self] in
@@ -583,25 +588,45 @@ final class MainWindowController: NSObject, NSWindowDelegate {
     private func sendWindowAction(_ action: String, enabled: Bool? = nil) {
         guard let connection = viewConnection, remoteWindowState != nil,
               selectedWindow?.isMonitor != true else { return }
-        if action == "reading", enabled == true {
-            let size = (max(1, Int(videoView.bounds.width.rounded())),
-                        max(1, Int(videoView.bounds.height.rounded())))
-            lastReadingSize = size
-            connection.sendWindowAction(action, enabled: true, width: size.0, height: size.1)
-        } else {
-            connection.sendWindowAction(action, enabled: enabled)
+        if action == "reading" {
+            autoFitEnabled = enabled ?? !autoFitEnabled
+            readingResizeTask?.cancel()
+            lastReadingSize = nil
+            windowActionsView.update(state: remoteWindowState, windowId: selectedWindow?.id,
+                                     isMonitor: false, autoFitEnabled: autoFitEnabled)
+            if autoFitEnabled { scheduleReadingResize(debounce: false) }
+            else { connection.sendWindowAction(action, enabled: false) }
+            return
         }
+        if action == "minimize" {
+            readingResizeTask?.cancel()
+        } else if ["maximize", "close"].contains(action) ||
+            (action == "restore" && remoteWindowState?.minimized != true) {
+            let wasAutoFitEnabled = autoFitEnabled
+            autoFitEnabled = false
+            readingResizeTask?.cancel()
+            lastReadingSize = nil
+            if wasAutoFitEnabled { connection.sendWindowAction("reading", enabled: false) }
+        } else if action == "restore" {
+            lastReadingSize = nil
+        }
+        windowActionsView.update(state: remoteWindowState, windowId: selectedWindow?.id,
+                                 isMonitor: false, autoFitEnabled: autoFitEnabled)
+        connection.sendWindowAction(action, enabled: enabled)
     }
 
-    private func scheduleReadingResize() {
+    private func scheduleReadingResize(debounce: Bool = true) {
         readingResizeTask?.cancel()
         readingResizeTask = Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(120))
-            guard !Task.isCancelled, let self, self.remoteWindowState?.reading == true,
+            if debounce { try? await Task.sleep(for: .milliseconds(120)) }
+            guard !Task.isCancelled, let self, self.autoFitEnabled,
+                  self.selectedWindow?.isMonitor != true,
+                  self.remoteWindowState?.windowId == self.selectedWindow?.id,
+                  self.remoteWindowState?.canResize == true,
                   self.remoteWindowState?.minimized != true,
                   let connection = self.viewConnection else { return }
-            let size = (max(1, Int(self.videoView.bounds.width.rounded())),
-                        max(1, Int(self.videoView.bounds.height.rounded())))
+            let size = (Int(self.videoView.bounds.width.rounded()), Int(self.videoView.bounds.height.rounded()))
+            guard size.0 > 0, size.1 > 0 else { return }
             guard self.lastReadingSize?.0 != size.0 || self.lastReadingSize?.1 != size.1 else { return }
             self.lastReadingSize = size
             connection.sendWindowAction("reading", enabled: true, width: size.0, height: size.1)
@@ -614,7 +639,8 @@ final class MainWindowController: NSObject, NSWindowDelegate {
             refreshBar()
         }
         if selectedWindow?.id == state.windowId { selectedWindow?.minimized = state.minimized }
-        windowActionsView.update(state: state, windowId: target.id, isMonitor: target.isMonitor)
+        windowActionsView.update(state: state, windowId: target.id, isMonitor: target.isMonitor,
+                                 autoFitEnabled: autoFitEnabled)
         videoView.resetInput()
         let paused = state.minimized
         videoView.isHidden = paused
@@ -705,6 +731,11 @@ final class MainWindowController: NSObject, NSWindowDelegate {
     // MARK: - Recolher / espiar a lista de apps
 
     @objc private func settingsDidChange(_ notification: Notification) {
+        if appliedAutoFitPreference != settings.autoFitWindows {
+            appliedAutoFitPreference = settings.autoFitWindows
+            autoFitEnabled = settings.autoFitWindows
+            sendWindowAction("reading", enabled: autoFitEnabled)
+        }
         applySettings()
     }
 
@@ -1208,7 +1239,7 @@ final class MainWindowController: NSObject, NSWindowDelegate {
         let controller = RemoteWindowController(
             target: target, host: host, port: number,
             pin: creds.token == nil ? pin.stringValue : nil,
-            deviceToken: creds.token, fingerprint: creds.fingerprint)
+            deviceToken: creds.token, fingerprint: creds.fingerprint, settings: settings)
         settings.applyAppearance(to: controller.window)
         let targetId = target.id
         controller.onClose = { [weak self] in
@@ -1277,8 +1308,11 @@ final class MainWindowController: NSObject, NSWindowDelegate {
         selectedWindow = target
         remoteWindowState = nil
         restoreOnInitialWindowState = target.minimized
+        autoFitEnabled = settings.autoFitWindows
         lastReadingSize = nil
-        windowActionsView.update(state: nil, windowId: target.id, isMonitor: target.isMonitor)
+        readingResizeTask?.cancel()
+        windowActionsView.update(state: nil, windowId: target.id, isMonitor: target.isMonitor,
+                                 autoFitEnabled: autoFitEnabled)
         streamSupportsScaling = nil
         thumbnailBar.setSelected(windowId: target.id)
 
@@ -1327,7 +1361,8 @@ final class MainWindowController: NSObject, NSWindowDelegate {
                     self.remoteWindowState = nil
                     self.lastReadingSize = nil
                     self.readingResizeTask?.cancel()
-                    self.windowActionsView.update(state: nil, windowId: target.id, isMonitor: target.isMonitor)
+                    self.windowActionsView.update(state: nil, windowId: target.id, isMonitor: target.isMonitor,
+                                                  autoFitEnabled: self.autoFitEnabled)
                     if message.hasPrefix(RemoteConnection.authFailurePrefix) {
                         self.wantsConnection = false
                         self.pendingFavoriteLaunch = nil
@@ -1404,10 +1439,20 @@ final class MainWindowController: NSObject, NSWindowDelegate {
                     self.restoreOnInitialWindowState = false
                     if state.minimized { self.viewConnection?.sendWindowAction("restore") }
                 }
+                if !state.minimized { self.scheduleReadingResize() }
             },
             onWindowCommandResult: { [weak self] action, success, message in
                 guard let self, self.viewGeneration == current else { return }
-                if !success { self.streamStatusLabel.stringValue = message ?? "O Windows recusou a ação \(action)." }
+                if !success {
+                    if action == "reading" {
+                        self.autoFitEnabled = false
+                        self.readingResizeTask?.cancel()
+                        self.windowActionsView.update(state: self.remoteWindowState, windowId: target.id,
+                                                      isMonitor: target.isMonitor,
+                                                      autoFitEnabled: self.autoFitEnabled)
+                    }
+                    self.streamStatusLabel.stringValue = message ?? "O Windows recusou a ação \(action)."
+                }
             },
             onWindowMenus: { [weak self] menus in
                 guard let self, self.viewGeneration == current else { return }
@@ -1466,7 +1511,9 @@ final class MainWindowController: NSObject, NSWindowDelegate {
         readingResizeTask?.cancel()
         readingResizeTask = nil
         lastReadingSize = nil
-        windowActionsView.update(state: nil, windowId: selectedWindow?.id, isMonitor: selectedWindow?.isMonitor == true)
+        windowActionsView.update(state: nil, windowId: selectedWindow?.id,
+                                 isMonitor: selectedWindow?.isMonitor == true,
+                                 autoFitEnabled: autoFitEnabled)
         selectedWindow = nil
         streamSupportsScaling = nil
         thumbnailBar.setSelected(windowId: nil)
@@ -1654,7 +1701,6 @@ final class MainWindowController: NSObject, NSWindowDelegate {
     func windowDidResize(_ notification: Notification) {
         titlebarAccessory.view.setFrameSize(NSSize(width: window.frame.width - 180, height: 28))
         updateVideoInteractionExclusions()
-        if remoteWindowState?.reading == true { scheduleReadingResize() }
     }
     func windowWillClose(_ notification: Notification) {
         closeSettings()

@@ -29,6 +29,7 @@ final class AppSettings {
         static let appearance = "settings.appearance"
         static let accent = "settings.accent"
         static let accentColor = "settings.accentColor"
+        static let autoFitWindows = "settings.autoFitWindows"
     }
 
     private let defaults: UserDefaults
@@ -60,6 +61,15 @@ final class AppSettings {
     var accent: AppAccent {
         get { stored(AppAccent.self, key: Key.accent, fallback: .system) }
         set { save(newValue.rawValue, key: Key.accent) }
+    }
+
+    var autoFitWindows: Bool {
+        get { defaults.object(forKey: Key.autoFitWindows) as? Bool ?? true }
+        set {
+            guard defaults.object(forKey: Key.autoFitWindows) as? Bool != newValue else { return }
+            defaults.set(newValue, forKey: Key.autoFitWindows)
+            changed()
+        }
     }
 
     var accentColor: NSColor {

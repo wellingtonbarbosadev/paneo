@@ -11,6 +11,7 @@ final class WindowActionsView: NSView, NSMenuDelegate {
 
     private let button = NSButton(title: "Janela", target: nil, action: nil)
     private var state: RemoteWindowState?
+    private var autoFitEnabled = false
     private var menuSnapshot: RemoteWindowMenus?
     private var waitingForMenus = false
     private var menuWaitTask: Task<Void, Never>?
@@ -37,8 +38,10 @@ final class WindowActionsView: NSView, NSMenuDelegate {
 
     required init?(coder: NSCoder) { fatalError("A interface é construída em código; nib não é suportado.") }
 
-    func update(state: RemoteWindowState?, windowId: Int64? = nil, isMonitor: Bool) {
+    func update(state: RemoteWindowState?, windowId: Int64? = nil, isMonitor: Bool,
+                autoFitEnabled: Bool = false) {
         self.state = isMonitor || (windowId != nil && state?.windowId != windowId) ? nil : state
+        self.autoFitEnabled = autoFitEnabled && (self.state?.canResize == true || self.state?.reading == true)
         menuSnapshot = nil
         updateAvailability()
     }
@@ -89,9 +92,9 @@ final class WindowActionsView: NSView, NSMenuDelegate {
                   action: state.maximized || state.minimized ? "restore" : "maximize",
                   enabled: state.maximized || state.minimized || state.canResize, to: menu)
         menu.addItem(.separator())
-        addAction(state.reading ? "Sair do modo leitura" : "Modo leitura",
-                  action: "reading", enabled: state.canResize, to: menu,
-                  checked: state.reading)
+        addAction("Ajustar automaticamente",
+                  action: "reading", enabled: state.canResize || autoFitEnabled, to: menu,
+                  checked: autoFitEnabled)
         menu.addItem(.separator())
         addAction("Fechar no Windows…", action: "close", enabled: true, to: menu)
         menu.addItem(.separator())
@@ -116,8 +119,7 @@ final class WindowActionsView: NSView, NSMenuDelegate {
 
     @objc private func performAction(_ sender: NSMenuItem) {
         guard let action = sender.representedObject as? String else { return }
-        let enabled = action == "reading" ? !(state?.reading ?? false) : nil
-        onAction?(action, enabled)
+        onAction?(action, nil)
     }
 
     @objc private func invokeMenu(_ sender: NSMenuItem) {

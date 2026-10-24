@@ -16,6 +16,7 @@ final class SettingsViewController: NSViewController {
     private let densityChoices = NSStackView()
     private let accentChoices = NSStackView()
     private let accentWell = NSColorWell(frame: .zero)
+    private let autoFitWindowsButton = NSButton(checkboxWithTitle: "Ajustar janelas automaticamente", target: nil, action: nil)
     private var choiceButtons: [String: [NSButton]] = [:]
 
     init(settings: AppSettings = .shared) {
@@ -34,7 +35,7 @@ final class SettingsViewController: NSViewController {
         let stack = SettingsDocumentStackView()
         stack.orientation = .vertical
         stack.alignment = .leading
-        stack.spacing = 20
+        stack.spacing = 14
         stack.translatesAutoresizingMaskIntoConstraints = false
         scroll.documentView = stack
 
@@ -80,20 +81,25 @@ final class SettingsViewController: NSViewController {
         let barContent = NSStackView()
         barContent.orientation = .vertical
         barContent.alignment = .leading
-        barContent.spacing = 10
+        barContent.spacing = 6
         positionChoices.orientation = .horizontal
         positionChoices.spacing = 10
         densityChoices.orientation = .horizontal
         densityChoices.spacing = 10
         barContent.addArrangedSubview(Self.field("Posição", positionChoices))
         barContent.addArrangedSubview(Self.field("Densidade", densityChoices))
+        autoFitWindowsButton.target = self
+        autoFitWindowsButton.action = #selector(autoFitWindowsChanged(_:))
+        autoFitWindowsButton.setAccessibilityHelp("Redimensiona as janelas remotas para acompanhar o espaço disponível para vídeo.")
+        autoFitWindowsButton.toolTip = "Redimensiona as janelas remotas para acompanhar o espaço disponível para vídeo."
+        barContent.addArrangedSubview(autoFitWindowsButton)
 
         let appearanceSection = Self.section(title: "Aparência", content: appearanceContent)
-        let barSection = Self.section(title: "Barra de aplicativos", content: barContent)
+        let barSection = Self.section(title: "Barra e janelas", content: barContent)
         let settingsColumn = NSStackView(views: [appearanceSection, barSection])
         settingsColumn.orientation = .vertical
         settingsColumn.alignment = .leading
-        settingsColumn.spacing = 12
+        settingsColumn.spacing = 6
         settingsColumn.translatesAutoresizingMaskIntoConstraints = false
         columns.addArrangedSubview(settingsColumn)
         columns.addArrangedSubview(previewSection)
@@ -115,8 +121,8 @@ final class SettingsViewController: NSViewController {
             closeButton.heightAnchor.constraint(equalToConstant: 32),
             scroll.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             scroll.trailingAnchor.constraint(equalTo: content.trailingAnchor),
-            scroll.topAnchor.constraint(equalTo: heading.bottomAnchor, constant: 20),
-            scroll.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -20),
+            scroll.topAnchor.constraint(equalTo: heading.bottomAnchor, constant: 16),
+            scroll.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -12),
             stack.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
             stack.trailingAnchor.constraint(equalTo: scroll.contentView.trailingAnchor),
             stack.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
@@ -142,6 +148,7 @@ final class SettingsViewController: NSViewController {
         accentWell.target = self
         accentWell.action = #selector(colorChanged(_:))
         NotificationCenter.default.addObserver(self, selector: #selector(settingsDidChange), name: AppSettings.didChange, object: settings)
+        autoFitWindowsButton.state = settings.autoFitWindows ? .on : .off
         refreshChoices()
         updatePreview()
     }
@@ -238,10 +245,15 @@ final class SettingsViewController: NSViewController {
         updatePreview()
     }
 
+    @objc private func autoFitWindowsChanged(_ sender: NSButton) {
+        settings.autoFitWindows = sender.state == .on
+    }
+
     @objc private func settingsDidChange() {
         if let window = view.window { settings.applyAppearance(to: window) }
         accentWell.color = settings.accentColor
         accentWell.isEnabled = settings.accent == .custom
+        autoFitWindowsButton.state = settings.autoFitWindows ? .on : .off
         refreshChoices()
         updatePreview()
     }
@@ -287,7 +299,7 @@ final class SettingsViewController: NSViewController {
         let stack = NSStackView(views: [self.title(title, size: 16), content])
         stack.orientation = .vertical
         stack.alignment = .leading
-        stack.spacing = 10
+        stack.spacing = 8
         stack.translatesAutoresizingMaskIntoConstraints = false
         panel.addSubview(stack)
         NSLayoutConstraint.activate([
